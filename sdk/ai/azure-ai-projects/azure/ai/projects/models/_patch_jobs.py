@@ -230,9 +230,7 @@ class PipelineJob(_RestPipelineJob):
         return node
 
     @classmethod
-    def from_mldesigner(
-        cls, pipeline: Any, *, compute_id: str, component_ids: Mapping[str, str]
-    ) -> "PipelineJob":
+    def from_mldesigner(cls, pipeline: Any, *, compute_id: str, component_ids: Mapping[str, str]) -> "PipelineJob":
         """Convert a pipeline built with ``azure.ai.ml.dsl.pipeline`` and mldesigner components.
 
         Register the decorated command components in the same AML Project first,
@@ -281,7 +279,9 @@ class PipelineJob(_RestPipelineJob):
         missing = set(jobs) - set(component_ids)
         extra = set(component_ids) - set(jobs)
         if missing or extra:
-            raise ValueError(f"component_ids must match pipeline nodes (missing: {sorted(missing)}, extra: {sorted(extra)})")
+            raise ValueError(
+                f"component_ids must match pipeline nodes (missing: {sorted(missing)}, extra: {sorted(extra)})"
+            )
 
         nodes: Dict[str, Any] = {}
         workspaces = set()
@@ -317,8 +317,19 @@ class PipelineJob(_RestPipelineJob):
         component = node.get("component")
         cls._check_dsl_fields(
             component,
-            {"name", "version", "display_name", "type", "command", "code", "environment", "inputs", "outputs",
-             "tags", "is_deterministic"},
+            {
+                "name",
+                "version",
+                "display_name",
+                "type",
+                "command",
+                "code",
+                "environment",
+                "inputs",
+                "outputs",
+                "tags",
+                "is_deterministic",
+            },
             f"Pipeline component '{name}'",
         )
         if (
@@ -341,7 +352,9 @@ class PipelineJob(_RestPipelineJob):
             or not registered
             or registered.group("name").casefold() != component_name.casefold()
         ):
-            raise ValueError(f"Pipeline component '{name}' requires its own registered AML Project component version ID")
+            raise ValueError(
+                f"Pipeline component '{name}' requires its own registered AML Project component version ID"
+            )
         environment = component.get("environment")
         cls._check_dsl_fields(environment, {"image", "name", "version"}, f"Pipeline component '{name}' environment")
         if not isinstance(environment.get("image"), str) or not environment["image"]:

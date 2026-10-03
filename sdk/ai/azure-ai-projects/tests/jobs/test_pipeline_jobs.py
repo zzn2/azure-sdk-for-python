@@ -370,9 +370,7 @@ def test_pipeline_dsl_rejects_missing_or_wrong_registered_ids(ids: dict[str, str
         ),
     ],
 )
-def test_pipeline_dsl_rejects_unmapped_features(
-    monkeypatch: pytest.MonkeyPatch, change: Any, message: str
-) -> None:
+def test_pipeline_dsl_rejects_unmapped_features(monkeypatch: pytest.MonkeyPatch, change: Any, message: str) -> None:
     aml_job = _dsl_pipeline()
     graph = aml_job._to_dict()
     change(graph)
