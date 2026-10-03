@@ -354,9 +354,10 @@ def _assert_dsl_request(request: HttpRequest, expected: dict[str, Any], local_co
     assert request.headers["x-ms-foundry-job-route"] == "execution"
     assert parse_qs(urlparse(request.url).query)["api-version"] == ["2026-01-15-preview"]
     body = request.body
-    assert isinstance(body, bytes)
-    assert json.loads(body) == {"properties": expected}
-    assert all(code not in body.decode() for code in local_codes.values())
+    assert isinstance(body, (str, bytes))
+    wire_bytes = body.encode() if isinstance(body, str) else body
+    assert json.loads(wire_bytes) == {"properties": expected}
+    assert all(code.encode() not in wire_bytes for code in local_codes.values())
     for node in expected["jobs"].values():
         assert isinstance(node["component"], dict)
         assert "componentId" not in node
