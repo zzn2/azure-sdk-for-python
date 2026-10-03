@@ -179,7 +179,9 @@ with DefaultAzureCredential() as credential:
             compute_id=os.environ["JOB_COMPUTE_ID"],
             component_ids={"produced": writer_id, "read_message": reader_id},
         )
-        created = project.beta.jobs.create_or_update(name="read-after-write", job=job)
+        created = project.beta.jobs.create_or_update(
+            name="read-after-write", job=job, headers={"x-ms-foundry-job-route": "execution"}
+        )
         print(created.id)
 ```
 
