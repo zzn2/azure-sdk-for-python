@@ -189,7 +189,11 @@ For SDK usage examples in this package, see `samples/hosted_agents/`, including 
 Pass a local code folder to a `CommandJob` composed into a `PipelineJob`:
 
 ```python
+import os
+
+from azure.ai.projects import AIProjectClient
 from azure.ai.projects.models import CommandJob, PipelineJob
+from azure.identity import DefaultAzureCredential
 
 compute_id = os.environ["JOB_COMPUTE_ID"]
 job = PipelineJob(
@@ -203,7 +207,9 @@ job = PipelineJob(
         )
     },
 )
-created = project_client.beta.jobs.create_or_update(name="training-pipeline", job=job)
+with DefaultAzureCredential() as credential:
+    with AIProjectClient(endpoint=os.environ["FOUNDRY_PROJECT_ENDPOINT"], credential=credential) as project_client:
+        created = project_client.beta.jobs.create_or_update(name="training-pipeline", job=job)
 ```
 
 The SDK uploads the folder as a dataset, as it does for standalone `CommandJob.code`, and sends the resulting dataset version ID in `jobs.train.component.code`. It does not register an AML Component. Raw pipeline graph dictionaries are passed through without automatic code upload. This preview path requires Foundry backend support for dataset version IDs in inline component code; until that support is available, the service may reject the submission.
