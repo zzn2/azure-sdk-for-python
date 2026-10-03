@@ -242,12 +242,12 @@ class JobsOperations(_GeneratedJobsOps):
         await self._resolve_input_paths(name, job)
 
     async def _resolve_pipeline_code(self, name: str, job: PipelineJob) -> None:
-        """Upload code only for inline nodes composed from CommandJob objects."""
+        """Upload code for inline nodes composed from CommandJobs or DSL pipelines."""
         for node_name, (code, base_path) in job._code_sources.items():
             node = (job.jobs or {}).get(node_name)
             component = node.get("component") if isinstance(node, dict) else None
             if not isinstance(component, dict) or component.get("code") != code:
-                raise ValueError(f"Pipeline node '{node_name}' code changed after CommandJob composition.")
+                raise ValueError(f"Pipeline node '{node_name}' code changed after pipeline composition.")
             resolved = await self._resolve_asset_uri(code, f"{name}-{node_name}-code", base_path=base_path)
             component["code"] = resolved
             job._code_sources[node_name] = (resolved, base_path)

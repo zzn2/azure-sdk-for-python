@@ -218,6 +218,46 @@ with DefaultAzureCredential() as credential:
 
 The SDK uploads the folder as a dataset, as it does for standalone `CommandJob.code`, and sends the resulting dataset version ID in `jobs.train.component.code`. It does not register an AML Component. Raw pipeline graph dictionaries are passed through without automatic code upload. This preview path requires Foundry backend support for dataset version IDs in inline component code; until that support is available, the service may reject the submission.
 
+### Compose a pipeline with mldesigner (preview)
+
+Install the optional dependencies with `pip install "azure-ai-projects[mldesigner]"`. Define command components and bind a file output to the next node:
+
+```python
+import os
+
+import mldesigner
+from azure.ai.ml import dsl
+from azure.ai.projects import AIProjectClient
+from azure.ai.projects.models import PipelineJob
+from azure.identity import DefaultAzureCredential
+
+image = os.environ["JOB_ENVIRONMENT_IMAGE"]  # Include mldesigner in this image.
+
+@mldesigner.command_component(name="produce", environment={"image": image})
+def produce(message: str, output: mldesigner.Output(type="uri_file")):
+    with open(output, "w", encoding="utf-8") as target:
+        target.write(message)
+
+@mldesigner.command_component(name="consume", environment={"image": image})
+def consume(source: mldesigner.Input(type="uri_file")):
+    with open(source, encoding="utf-8") as saved:
+        print(saved.read())
+
+@dsl.pipeline(name="dsl-demo")
+def workflow(message: str = "world"):
+    produced = produce(message=message)
+    consume(source=produced.outputs.output)
+
+job = PipelineJob.from_mldesigner(workflow(), compute_id=os.environ["JOB_COMPUTE_ID"])
+with DefaultAzureCredential() as credential:
+    with AIProjectClient(endpoint=os.environ["FOUNDRY_PROJECT_ENDPOINT"], credential=credential) as client:
+        client.beta.jobs.create_or_update(
+            name="dsl-demo", job=job, headers={"x-ms-foundry-job-route": "execution"}
+        )
+```
+
+The SDK uploads each generated local code folder through the same dataset API used by `CommandJob`, then sends its dataset version ID as `jobs.<node>.component.code` inside an inline command component. It does not register AML Components. Only direct-image commands, literal string pipeline inputs, and `uri_file` output-to-input bindings are supported. The backend copy bridge in [Vienna !2339787](https://msdata.visualstudio.com/DefaultCollection/Vienna/_git/vienna/pullrequest/2339787) is unmerged/in review and has not been deployed or runtime-verified; submission may fail until that support is available.
+
 ## Client-side tracing
 
 See [Add client-side tracing to Foundry agents (preview)](https://learn.microsoft.com/azure/foundry/observability/how-to/trace-agent-client-side?tabs=python).

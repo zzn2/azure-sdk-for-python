@@ -253,6 +253,28 @@ def _code_folder(tmp_path: Path) -> Path:
     return folder
 
 
+def _dsl_pipeline() -> Any:
+    designer = pytest.importorskip("mldesigner")
+    dsl = pytest.importorskip("azure.ai.ml").dsl
+
+    @designer.command_component(name="produce", environment={"image": "example.azurecr.io/test:latest"})
+    def produce(message: str, output: designer.Output(type="uri_file")):  # pyright: ignore[reportInvalidTypeForm]
+        with open(output, "w", encoding="utf-8") as target:
+            target.write(message)
+
+    @designer.command_component(name="consume", environment={"image": "example.azurecr.io/test:latest"})
+    def consume(source: designer.Input(type="uri_file")):  # pyright: ignore[reportInvalidTypeForm]
+        with open(source, encoding="utf-8") as saved:
+            print(saved.read())
+
+    @dsl.pipeline(name="dsl-demo")
+    def example(message: str = "world"):
+        produced = produce(message=message)
+        consume(source=produced.outputs.output)
+
+    return example()
+
+
 def _mock_code_upload(
     monkeypatch: pytest.MonkeyPatch, operations: Any, *, async_upload: bool = False
 ) -> tuple[Mock, Mock]:
@@ -276,6 +298,67 @@ def _assert_uploaded_code(request: HttpRequest, name: str, version: str) -> None
     expected["jobs"]["hello"]["component"]["code"] = f"{_DATASET_PREFIX}/{name}/versions/{version}"
     assert json.loads(request.body) == {"properties": expected}
     assert "codeId" not in expected["jobs"]["hello"]["component"]
+
+
+def _dsl_expected_properties(aml_job: Any, code_ids: dict[str, str]) -> dict[str, Any]:
+    graph = aml_job._to_dict()
+    produced = graph["jobs"]["produced"]["component"]
+    consumed = graph["jobs"]["consumed"]["component"]
+    return {
+        "jobType": "Pipeline",
+        "displayName": "dsl-demo",
+        "computeId": _COMPUTE,
+        "settings": {"default_compute": _COMPUTE},
+        "inputs": {"message": {"jobInputType": "literal", "value": "world"}},
+        "outputs": {},
+        "jobs": {
+            "produced": {
+                "type": "command",
+                "component": {
+                    "name": "produce",
+                    "version": "1",
+                    "type": "command",
+                    "command": produced["command"],
+                    "code": code_ids["produced"],
+                    "environment": {"image": "example.azurecr.io/test:latest"},
+                    "inputs": {"message": {"type": "string"}},
+                    "outputs": {"output": {"type": "uri_file"}},
+                },
+                "inputs": {"message": {"job_input_type": "literal", "value": "${{parent.inputs.message}}"}},
+                "outputs": {},
+            },
+            "consumed": {
+                "type": "command",
+                "component": {
+                    "name": "consume",
+                    "version": "1",
+                    "type": "command",
+                    "command": consumed["command"],
+                    "code": code_ids["consumed"],
+                    "environment": {"image": "example.azurecr.io/test:latest"},
+                    "inputs": {"source": {"type": "uri_file"}},
+                    "outputs": {},
+                },
+                "inputs": {
+                    "source": {"job_input_type": "literal", "value": "${{parent.jobs.produced.outputs.output}}"}
+                },
+                "outputs": {},
+            },
+        },
+    }
+
+
+def _assert_dsl_request(request: HttpRequest, expected: dict[str, Any], local_codes: dict[str, str]) -> None:
+    assert request.method == "PUT"
+    assert request.headers["Foundry-Features"] == "Jobs=V1Preview"
+    assert request.headers["x-ms-foundry-job-route"] == "execution"
+    assert parse_qs(urlparse(request.url).query)["api-version"] == ["2026-01-15-preview"]
+    assert json.loads(request.body) == {"properties": expected}
+    assert all(code not in request.body.decode() for code in local_codes.values())
+    for node in expected["jobs"].values():
+        assert isinstance(node["component"], dict)
+        assert "componentId" not in node
+        assert "codeId" not in node["component"]
 
 
 def _assert_inline_request(request: HttpRequest) -> None:
@@ -359,6 +442,116 @@ async def test_jobs_async_uploads_composed_command_code(monkeypatch: pytest.Monk
     assert len(transport.requests) == 1
     _assert_uploaded_code(transport.requests[0], "pipeline-hello-code", version)
     assert command.code == str(folder)
+
+
+def test_pipeline_sync_uploads_mldesigner_code_and_binds_nodes(monkeypatch: pytest.MonkeyPatch) -> None:
+    aml_job = _dsl_pipeline()
+    pipeline = PipelineJob.from_mldesigner(aml_job, compute_id=_COMPUTE)
+    local_codes = {name: source[0] for name, source in pipeline._code_sources.items()}
+    assert set(local_codes) == {"produced", "consumed"}
+    assert all(Path(code).is_dir() for code in local_codes.values())
+    transport = _Transport([_response("Pipeline"), _response("Pipeline")])
+
+    with AIProjectClient(endpoint=_ENDPOINT, credential=_Credential(), transport=transport) as client:  # type: ignore[arg-type]
+        get, upload = _mock_code_upload(monkeypatch, client.beta.jobs)
+        client.beta.jobs.create_or_update(
+            "dsl-demo", pipeline, headers={"x-ms-foundry-job-route": "execution"}
+        )
+        client.beta.jobs.create_or_update(
+            "dsl-demo", pipeline, headers={"x-ms-foundry-job-route": "execution"}
+        )
+
+    assert upload.call_count == 2
+    calls = {entry.kwargs["name"]: entry.kwargs for entry in upload.call_args_list}
+    assert set(calls) == {"dsl-demo-produced-code", "dsl-demo-consumed-code"}
+    code_ids = {}
+    for node_name, source in local_codes.items():
+        name = f"dsl-demo-{node_name}-code"
+        assert calls[name]["folder"] == source
+        version = calls[name]["version"]
+        assert len(version) == 8
+        get.assert_any_call(name=name, version=version)
+        code_ids[node_name] = f"{_DATASET_PREFIX}/{name}/versions/{version}"
+    assert get.call_count == 2
+    assert len(transport.requests) == 2
+    for request in transport.requests:
+        _assert_dsl_request(request, _dsl_expected_properties(aml_job, code_ids), local_codes)
+    assert {name: source[0] for name, source in pipeline._code_sources.items()} == code_ids
+
+
+@pytest.mark.asyncio
+async def test_pipeline_async_uploads_mldesigner_code_and_binds_nodes(monkeypatch: pytest.MonkeyPatch) -> None:
+    aml_job = _dsl_pipeline()
+    pipeline = PipelineJob.from_mldesigner(aml_job, compute_id=_COMPUTE)
+    local_codes = {name: source[0] for name, source in pipeline._code_sources.items()}
+    transport = _AsyncTransport([_response("Pipeline")])
+
+    async with AsyncAIProjectClient(
+        endpoint=_ENDPOINT, credential=_AsyncCredential(), transport=transport  # type: ignore[arg-type]
+    ) as client:
+        get, upload = _mock_code_upload(monkeypatch, client.beta.jobs, async_upload=True)
+        await client.beta.jobs.create_or_update(
+            "dsl-demo", pipeline, headers={"x-ms-foundry-job-route": "execution"}
+        )
+
+    assert upload.await_count == 2
+    calls = {entry.kwargs["name"]: entry.kwargs for entry in upload.call_args_list}
+    assert set(calls) == {"dsl-demo-produced-code", "dsl-demo-consumed-code"}
+    code_ids = {}
+    for node_name, source in local_codes.items():
+        name = f"dsl-demo-{node_name}-code"
+        assert calls[name]["folder"] == source
+        version = calls[name]["version"]
+        get.assert_any_await(name=name, version=version)
+        code_ids[node_name] = f"{_DATASET_PREFIX}/{name}/versions/{version}"
+    assert get.await_count == 2
+    assert len(transport.requests) == 1
+    _assert_dsl_request(transport.requests[0], _dsl_expected_properties(aml_job, code_ids), local_codes)
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        (lambda graph: graph.update({"outputs": {"result": {"type": "uri_file"}}}), "Pipeline outputs"),
+        (lambda graph: graph.update({"settings": {"force_rerun": True}}), "unsupported fields"),
+        (lambda graph: graph["jobs"]["produced"].update({"type": "sweep"}), "must be a command"),
+        (
+            lambda graph: graph["jobs"]["produced"]["component"].update({"code": "./missing-directory"}),
+            "existing local code directory",
+        ),
+        (
+            lambda graph: graph["jobs"]["produced"]["component"].update({"code": "../produce/produce.yaml"}),
+            "existing local code directory",
+        ),
+        (
+            lambda graph: graph["jobs"]["produced"]["component"].update({"inputs": {"message": {"type": "integer"}}}),
+            "unsupported type",
+        ),
+        (
+            lambda graph: graph["jobs"]["consumed"]["inputs"]["source"].update(
+                {"path": "${{parent.jobs.produced.outputs.other}}"}
+            ),
+            "unknown or mismatched output",
+        ),
+        (
+            lambda graph: graph["jobs"]["consumed"]["inputs"]["source"].update({"path": "./local-file"}),
+            "must bind an output",
+        ),
+        (
+            lambda graph: graph["jobs"]["consumed"].update({"component": "../consume/consume.yaml"}),
+            "must be a mapping",
+        ),
+    ],
+)
+def test_pipeline_mldesigner_rejects_unmapped_features(
+    monkeypatch: pytest.MonkeyPatch, change: Any, message: str
+) -> None:
+    aml_job = _dsl_pipeline()
+    graph = aml_job._to_dict()
+    change(graph)
+    monkeypatch.setattr(aml_job, "_to_dict", lambda: graph)
+    with pytest.raises(ValueError, match=message):
+        PipelineJob.from_mldesigner(aml_job, compute_id=_COMPUTE)
 
 
 def test_pipeline_raw_graph_code_passes_through_without_upload(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
