@@ -209,7 +209,11 @@ job = PipelineJob(
 )
 with DefaultAzureCredential() as credential:
     with AIProjectClient(endpoint=os.environ["FOUNDRY_PROJECT_ENDPOINT"], credential=credential) as project_client:
-        created = project_client.beta.jobs.create_or_update(name="training-pipeline", job=job)
+        created = project_client.beta.jobs.create_or_update(
+            name="training-pipeline",
+            job=job,
+            headers={"x-ms-foundry-job-route": "execution"},
+        )
 ```
 
 The SDK uploads the folder as a dataset, as it does for standalone `CommandJob.code`, and sends the resulting dataset version ID in `jobs.train.component.code`. It does not register an AML Component. Raw pipeline graph dictionaries are passed through without automatic code upload. This preview path requires Foundry backend support for dataset version IDs in inline component code; until that support is available, the service may reject the submission.
