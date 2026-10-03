@@ -270,7 +270,7 @@ def _dsl_pipeline() -> Any:
     @dsl.pipeline(name="dsl-demo")
     def example(message: str = "world"):
         produced = produce(message=message)
-        consume(source=produced.outputs.output)
+        consumed = consume(source=produced.outputs.output)
 
     return example()
 
@@ -353,8 +353,10 @@ def _assert_dsl_request(request: HttpRequest, expected: dict[str, Any], local_co
     assert request.headers["Foundry-Features"] == "Jobs=V1Preview"
     assert request.headers["x-ms-foundry-job-route"] == "execution"
     assert parse_qs(urlparse(request.url).query)["api-version"] == ["2026-01-15-preview"]
-    assert json.loads(request.body) == {"properties": expected}
-    assert all(code not in request.body.decode() for code in local_codes.values())
+    body = request.body
+    assert isinstance(body, bytes)
+    assert json.loads(body) == {"properties": expected}
+    assert all(code not in body.decode() for code in local_codes.values())
     for node in expected["jobs"].values():
         assert isinstance(node["component"], dict)
         assert "componentId" not in node
@@ -454,12 +456,8 @@ def test_pipeline_sync_uploads_mldesigner_code_and_binds_nodes(monkeypatch: pyte
 
     with AIProjectClient(endpoint=_ENDPOINT, credential=_Credential(), transport=transport) as client:  # type: ignore[arg-type]
         get, upload = _mock_code_upload(monkeypatch, client.beta.jobs)
-        client.beta.jobs.create_or_update(
-            "dsl-demo", pipeline, headers={"x-ms-foundry-job-route": "execution"}
-        )
-        client.beta.jobs.create_or_update(
-            "dsl-demo", pipeline, headers={"x-ms-foundry-job-route": "execution"}
-        )
+        client.beta.jobs.create_or_update("dsl-demo", pipeline, headers={"x-ms-foundry-job-route": "execution"})
+        client.beta.jobs.create_or_update("dsl-demo", pipeline, headers={"x-ms-foundry-job-route": "execution"})
 
     assert upload.call_count == 2
     calls = {entry.kwargs["name"]: entry.kwargs for entry in upload.call_args_list}
@@ -490,9 +488,7 @@ async def test_pipeline_async_uploads_mldesigner_code_and_binds_nodes(monkeypatc
         endpoint=_ENDPOINT, credential=_AsyncCredential(), transport=transport  # type: ignore[arg-type]
     ) as client:
         get, upload = _mock_code_upload(monkeypatch, client.beta.jobs, async_upload=True)
-        await client.beta.jobs.create_or_update(
-            "dsl-demo", pipeline, headers={"x-ms-foundry-job-route": "execution"}
-        )
+        await client.beta.jobs.create_or_update("dsl-demo", pipeline, headers={"x-ms-foundry-job-route": "execution"})
 
     assert upload.await_count == 2
     calls = {entry.kwargs["name"]: entry.kwargs for entry in upload.call_args_list}
