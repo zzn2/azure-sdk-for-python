@@ -465,7 +465,7 @@ def test_pipeline_sync_uploads_mldesigner_code_and_binds_nodes(monkeypatch: pyte
     code_ids = {}
     for node_name, source in local_codes.items():
         name = f"dsl-demo-{node_name}-code"
-        assert calls[name]["folder"] == source
+        assert Path(calls[name]["folder"]) == Path(source)
         version = calls[name]["version"]
         assert len(version) == 8
         get.assert_any_call(name=name, version=version)
@@ -496,7 +496,7 @@ async def test_pipeline_async_uploads_mldesigner_code_and_binds_nodes(monkeypatc
     code_ids = {}
     for node_name, source in local_codes.items():
         name = f"dsl-demo-{node_name}-code"
-        assert calls[name]["folder"] == source
+        assert Path(calls[name]["folder"]) == Path(source)
         version = calls[name]["version"]
         get.assert_any_await(name=name, version=version)
         code_ids[node_name] = f"{_DATASET_PREFIX}/{name}/versions/{version}"
