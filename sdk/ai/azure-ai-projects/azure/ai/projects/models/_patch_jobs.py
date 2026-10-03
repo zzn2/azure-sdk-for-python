@@ -403,7 +403,7 @@ class PipelineJob(_RestPipelineJob):
             elif is_path or input_type != "string":
                 raise ValueError(f"Pipeline node '{name}' input '{port}' must bind an output or be a literal string")
             converted_inputs[port] = {"job_input_type": "literal", "value": value}
-        return {"type": "command", "component": component_id, "inputs": converted_inputs, "outputs": {}}
+        return {"type": "command", "componentId": component_id, "inputs": converted_inputs, "outputs": {}}
 
     @property
     def name(self) -> Optional[str]:

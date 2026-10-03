@@ -280,13 +280,13 @@ _DSL_PIPELINE_PROPERTIES = {
     "jobs": {
         "produced": {
             "type": "command",
-            "component": _component_ids()["produced"],
+            "componentId": _component_ids()["produced"],
             "inputs": {"message": {"job_input_type": "literal", "value": "${{parent.inputs.message}}"}},
             "outputs": {},
         },
         "consumed": {
             "type": "command",
-            "component": _component_ids()["consumed"],
+            "componentId": _component_ids()["consumed"],
             "inputs": {"source": {"job_input_type": "literal", "value": "${{parent.jobs.produced.outputs.output}}"}},
             "outputs": {},
         },
