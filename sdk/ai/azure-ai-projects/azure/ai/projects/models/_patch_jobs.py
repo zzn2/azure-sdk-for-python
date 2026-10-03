@@ -10,7 +10,7 @@ import json
 from collections.abc import Mapping
 from os import PathLike
 from pathlib import Path
-from typing import IO, Any, AnyStr, Dict, List, Optional, Union
+from typing import IO, Any, AnyStr, Dict, List, Optional, Tuple, Union
 
 from ._models import (
     CommandJob as _RestCommandJob,
@@ -110,7 +110,8 @@ class PipelineJob(_RestPipelineJob):
 
     When constructing a pipeline, ``jobs`` accepts raw graph node dictionaries
     or :class:`CommandJob` instances with literal inputs. Command jobs are
-    converted to inline command nodes; use raw dictionaries for other features.
+    converted to inline command nodes. Their local code folders are uploaded
+    when the pipeline is submitted; use raw dictionaries for other features.
 
     :ivar name: The name of the job. Read-only; populated after the job is created.
     :vartype name: str or None
@@ -123,7 +124,13 @@ class PipelineJob(_RestPipelineJob):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         fields = args[0] if args and isinstance(args[0], Mapping) else kwargs
         jobs = fields.get("jobs")
+        code_sources: Dict[str, Tuple[str, Optional[Union[str, PathLike[str]]]]] = {}
         if isinstance(jobs, dict) and any(isinstance(node, CommandJob) for node in jobs.values()):
+            code_sources = {
+                name: (node.code, node._base_path)
+                for name, node in jobs.items()
+                if isinstance(node, CommandJob) and isinstance(node.code, str)
+            }
             settings = fields.get("settings")
             default_compute = settings.get("default_compute") if isinstance(settings, dict) else None
             default_compute = default_compute or fields.get("computeId" if args else "compute_id")
@@ -137,6 +144,7 @@ class PipelineJob(_RestPipelineJob):
         self._name: Optional[str] = None
         self._id: Optional[str] = None
         self._system_data: Optional[SystemData] = None
+        self._code_sources = code_sources
 
     @classmethod
     def _convert_jobs(cls, jobs: Dict[str, Any], default_compute: Optional[str]) -> Dict[str, Any]:
@@ -150,6 +158,7 @@ class PipelineJob(_RestPipelineJob):
         unsupported = set(job.as_dict(exclude_readonly=True)) - {
             "jobType",
             "command",
+            "codeId",
             "environmentImageReference",
             "computeId",
             "inputs",
@@ -197,6 +206,10 @@ class PipelineJob(_RestPipelineJob):
             "inputs": inputs,
             "outputs": {},
         }
+        if job.code is not None:
+            if not job.code.strip():
+                raise ValueError(f"Pipeline node '{name}' requires a non-empty code path or URI.")
+            node["component"]["code"] = job.code
         if job.user_assigned_identity_id is not None:
             node["identity"] = {"type": "managed", "msi_resource_id": job.user_assigned_identity_id}
 

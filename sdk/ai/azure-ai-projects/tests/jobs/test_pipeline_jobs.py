@@ -4,12 +4,17 @@
 # ------------------------------------
 """Offline wire and response tests for Command and Pipeline jobs."""
 
+from copy import deepcopy
 import json
-from typing import Any, Union
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, Optional, Union
+from unittest.mock import AsyncMock, Mock
 from urllib.parse import parse_qs, urlparse
 
 import pytest
 from azure.core.credentials import AccessToken
+from azure.core.exceptions import ResourceNotFoundError
 from azure.core.pipeline.transport import (
     AsyncHttpResponse,
     AsyncHttpTransport,
@@ -24,6 +29,7 @@ from azure.ai.projects.models import AssetTypes, CommandJob, Input, JobResourceC
 
 _ENDPOINT = "https://fake-account.services.ai.azure.com/api/projects/fake-project"
 _COMPUTE = "/subscriptions/test/resourceGroups/test/providers/Microsoft.CognitiveServices/accounts/test/computes/cpu"
+_DATASET_PREFIX = "azureai://accounts/fake-account/projects/fake-project/data"
 _PIPELINE_PROPERTIES = {
     "jobType": "Pipeline",
     "displayName": "example pipeline",
@@ -212,9 +218,10 @@ def _assert_requests(requests: list[HttpRequest], kind: str, expected: dict[str,
     assert JobType.PIPELINE == "Pipeline"
 
 
-def _inline_pipeline() -> tuple[PipelineJob, CommandJob]:
+def _inline_pipeline(*, code: Optional[str] = None, base_path: Optional[Path] = None) -> tuple[PipelineJob, CommandJob]:
     command = CommandJob(
         command="echo hello ${{inputs.name}}",
+        code=code,
         environment_image_reference="example.azurecr.io/train:latest",
         compute=_COMPUTE,
         inputs={"name": Input(type=AssetTypes.LITERAL, value="${{parent.inputs.name}}")},
@@ -227,6 +234,8 @@ def _inline_pipeline() -> tuple[PipelineJob, CommandJob]:
             }
         ),
     )
+    if base_path is not None:
+        command._base_path = base_path
     pipeline = PipelineJob(
         compute_id=_COMPUTE,
         settings={"default_compute": _COMPUTE, "force_rerun": True},
@@ -235,6 +244,36 @@ def _inline_pipeline() -> tuple[PipelineJob, CommandJob]:
         jobs={"hello": command},
     )
     return pipeline, command
+
+
+def _code_folder(tmp_path: Path) -> Path:
+    folder = tmp_path / "code"
+    folder.mkdir()
+    (folder / "main.py").write_text("print('hello')\n", encoding="utf-8")
+    return folder
+
+
+def _mock_code_upload(monkeypatch: pytest.MonkeyPatch, operations: Any, *, async_upload: bool = False) -> tuple[Mock, Mock]:
+    mock_type = AsyncMock if async_upload else Mock
+    get = mock_type(side_effect=ResourceNotFoundError("dataset not found"))
+
+    def uploaded_dataset(*, name: str, version: str, **kwargs: Any) -> Any:
+        return SimpleNamespace(
+            id=f"{_DATASET_PREFIX}/{name}/versions/{version}",
+            data_uri="https://example.blob.core.windows.net/code",
+        )
+
+    upload = mock_type(side_effect=uploaded_dataset)
+    monkeypatch.setattr(operations._datasets, "get", get)
+    monkeypatch.setattr(operations._datasets, "upload_folder", upload)
+    return get, upload
+
+
+def _assert_uploaded_code(request: HttpRequest, name: str, version: str) -> None:
+    expected = deepcopy(_INLINE_PIPELINE_PROPERTIES)
+    expected["jobs"]["hello"]["component"]["code"] = f"{_DATASET_PREFIX}/{name}/versions/{version}"
+    assert json.loads(request.body) == {"properties": expected}
+    assert "codeId" not in expected["jobs"]["hello"]["component"]
 
 
 def _assert_inline_request(request: HttpRequest) -> None:
@@ -270,6 +309,114 @@ async def test_jobs_async_create_from_command_node() -> None:
 
     assert len(transport.requests) == 1
     _assert_inline_request(transport.requests[0])
+
+
+def test_jobs_sync_uploads_composed_command_code(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    folder = _code_folder(tmp_path)
+    pipeline, command = _inline_pipeline(code="code", base_path=tmp_path)
+    transport = _Transport([_response("Pipeline"), _response("Pipeline")])
+
+    with AIProjectClient(endpoint=_ENDPOINT, credential=_Credential(), transport=transport) as client:  # type: ignore[arg-type]
+        operations = client.beta.jobs
+        get, upload = _mock_code_upload(monkeypatch, operations)
+        operations.create_or_update("pipeline", pipeline)
+        operations.create_or_update("pipeline", pipeline)
+
+    upload.assert_called_once()
+    assert upload.call_args.kwargs["name"] == "pipeline-hello-code"
+    assert upload.call_args.kwargs["folder"] == str(folder)
+    version = upload.call_args.kwargs["version"]
+    assert len(version) == 8
+    get.assert_called_once_with(name="pipeline-hello-code", version=version)
+    assert len(transport.requests) == 2
+    for request in transport.requests:
+        _assert_uploaded_code(request, "pipeline-hello-code", version)
+    assert pipeline.jobs is not None
+    assert pipeline.jobs["hello"]["component"]["code"] == f"{_DATASET_PREFIX}/pipeline-hello-code/versions/{version}"
+    assert command.code == "code"
+
+
+@pytest.mark.asyncio
+async def test_jobs_async_uploads_composed_command_code(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    folder = _code_folder(tmp_path)
+    pipeline, command = _inline_pipeline(code=str(folder))
+    transport = _AsyncTransport([_response("Pipeline")])
+
+    async with AsyncAIProjectClient(
+        endpoint=_ENDPOINT, credential=_AsyncCredential(), transport=transport  # type: ignore[arg-type]
+    ) as client:
+        operations = client.beta.jobs
+        get, upload = _mock_code_upload(monkeypatch, operations, async_upload=True)
+        await operations.create_or_update("pipeline", pipeline)
+
+    upload.assert_awaited_once()
+    assert upload.call_args.kwargs["name"] == "pipeline-hello-code"
+    assert upload.call_args.kwargs["folder"] == str(folder)
+    version = upload.call_args.kwargs["version"]
+    get.assert_awaited_once_with(name="pipeline-hello-code", version=version)
+    assert len(transport.requests) == 1
+    _assert_uploaded_code(transport.requests[0], "pipeline-hello-code", version)
+    assert command.code == str(folder)
+
+
+def test_pipeline_raw_graph_code_passes_through_without_upload(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    folder = _code_folder(tmp_path)
+    pipeline = PipelineJob(compute_id=_COMPUTE, jobs={"raw": {"type": "command", "component": {"code": str(folder)}}})
+    transport = _Transport([_response("Pipeline")])
+
+    with AIProjectClient(endpoint=_ENDPOINT, credential=_Credential(), transport=transport) as client:  # type: ignore[arg-type]
+        operations = client.beta.jobs
+        get, upload = _mock_code_upload(monkeypatch, operations)
+        operations.create_or_update("pipeline", pipeline)
+
+    get.assert_not_called()
+    upload.assert_not_called()
+    assert json.loads(transport.requests[0].body)["properties"]["jobs"] == {
+        "raw": {"type": "command", "component": {"code": str(folder)}}
+    }
+
+
+def test_jobs_sync_command_code_keeps_code_id(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    folder = _code_folder(tmp_path)
+    command = CommandJob(
+        command="echo hello", code=str(folder), environment_image_reference="example.azurecr.io/train:latest", compute=_COMPUTE
+    )
+    transport = _Transport([_response("Command")])
+
+    with AIProjectClient(endpoint=_ENDPOINT, credential=_Credential(), transport=transport) as client:  # type: ignore[arg-type]
+        operations = client.beta.jobs
+        _, upload = _mock_code_upload(monkeypatch, operations)
+        operations.create_or_update("command", command)
+
+    upload.assert_called_once()
+    version = upload.call_args.kwargs["version"]
+    assert json.loads(transport.requests[0].body) == {
+        "properties": {**_COMMAND_PROPERTIES, "codeId": f"{_DATASET_PREFIX}/command-code/versions/{version}"}
+    }
+
+
+@pytest.mark.asyncio
+async def test_jobs_async_command_code_keeps_code_id(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    folder = _code_folder(tmp_path)
+    command = CommandJob(
+        command="echo hello", code=str(folder), environment_image_reference="example.azurecr.io/train:latest", compute=_COMPUTE
+    )
+    transport = _AsyncTransport([_response("Command")])
+
+    async with AsyncAIProjectClient(
+        endpoint=_ENDPOINT, credential=_AsyncCredential(), transport=transport  # type: ignore[arg-type]
+    ) as client:
+        operations = client.beta.jobs
+        _, upload = _mock_code_upload(monkeypatch, operations, async_upload=True)
+        await operations.create_or_update("command", command)
+
+    upload.assert_awaited_once()
+    version = upload.call_args.kwargs["version"]
+    assert json.loads(transport.requests[0].body) == {
+        "properties": {**_COMMAND_PROPERTIES, "codeId": f"{_DATASET_PREFIX}/command-code/versions/{version}"}
+    }
 
 
 def test_jobs_sync_create_from_mapping_with_command_node() -> None:
@@ -319,7 +466,7 @@ def test_pipeline_composes_commands_and_preserves_raw_graph_nodes() -> None:
 @pytest.mark.parametrize(
     ("extra", "message"),
     [
-        ({"code": "azureai:code:1"}, "codeId"),
+        ({"code": ""}, "non-empty code path or URI"),
         ({"inputs": {"data": Input(type=AssetTypes.URI_FILE, path="azureai:data:1")}}, "input 'data'"),
         ({"compute": "/subscriptions/test/computes/other"}, "default compute"),
         ({"resources": JobResourceConfiguration({"shmSize": "1g"})}, "shmSize"),

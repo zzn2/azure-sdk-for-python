@@ -184,6 +184,30 @@ For product guidance, see:
 
 For SDK usage examples in this package, see `samples/hosted_agents/`, including CRUD, file upload/download, and skills scenarios.
 
+### Local code in Pipeline jobs (preview)
+
+Pass a local code folder to a `CommandJob` composed into a `PipelineJob`:
+
+```python
+from azure.ai.projects.models import CommandJob, PipelineJob
+
+compute_id = os.environ["JOB_COMPUTE_ID"]
+job = PipelineJob(
+    compute_id=compute_id,
+    jobs={
+        "train": CommandJob(
+            command="python train.py",
+            code="./training-code",
+            environment_image_reference=os.environ["JOB_ENVIRONMENT_IMAGE"],
+            compute=compute_id,
+        )
+    },
+)
+created = project_client.beta.jobs.create_or_update(name="training-pipeline", job=job)
+```
+
+The SDK uploads the folder as a dataset, as it does for standalone `CommandJob.code`, and sends the resulting dataset version ID in `jobs.train.component.code`. It does not register an AML Component. Raw pipeline graph dictionaries are passed through without automatic code upload. This preview path requires Foundry backend support for dataset version IDs in inline component code; until that support is available, the service may reject the submission.
+
 ## Client-side tracing
 
 See [Add client-side tracing to Foundry agents (preview)](https://learn.microsoft.com/azure/foundry/observability/how-to/trace-agent-client-side?tabs=python).
