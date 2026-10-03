@@ -246,12 +246,12 @@ def _dsl_pipeline() -> Any:
     dsl = pytest.importorskip("azure.ai.ml").dsl
 
     @designer.command_component(name="produce", environment={"image": "example.azurecr.io/test:latest"})
-    def produce(message: str, output: designer.Output(type="uri_file")):
+    def produce(message: str, output: designer.Output(type="uri_file")):  # pyright: ignore[reportInvalidTypeForm]
         with open(output, "w", encoding="utf-8") as target:
             target.write(message)
 
     @designer.command_component(name="consume", environment={"image": "example.azurecr.io/test:latest"})
-    def consume(source: designer.Input(type="uri_file")):
+    def consume(source: designer.Input(type="uri_file")):  # pyright: ignore[reportInvalidTypeForm]
         with open(source, encoding="utf-8") as saved:
             print(saved.read())
 
