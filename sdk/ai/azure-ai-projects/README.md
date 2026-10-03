@@ -127,6 +127,64 @@ For comprehensive examples covering Agents, tool usage, evaluation, fine-tuning,
 
 The sections below cover SDK-specific behaviors (authentication variants, exception handling, logging, tracing) that are not documented in the above Learn pages.
 
+### Compose a Foundry pipeline with mldesigner (preview)
+
+Install `pip install "azure-ai-projects[mldesigner]"` to opt in to `mldesigner[pipeline]` and `azure-ai-ml`; these packages are not required for other AI Projects users. The decorated components must be registered in the **same AML Project workspace** that backs the Foundry project before converting the pipeline. Use the workspace's actual subscription ID, resource group, and name (not the compute's subscription or the Foundry endpoint's account name). Registration uploads the component code through the public `MLClient.components` API; the Foundry adapter does not upload code or register assets.
+
+Save the following as a Python file. Set `FOUNDRY_PROJECT_ENDPOINT`, `AML_PROJECT_SUBSCRIPTION_ID`, `AML_PROJECT_RESOURCE_GROUP`, `AML_PROJECT_WORKSPACE_NAME`, `JOB_COMPUTE_ID` (full compute resource ID), and `JOB_ENVIRONMENT_IMAGE` (a container image that includes Python and the `mldesigner` command). The credential needs permission to register components and submit jobs to the same project.
+
+```python
+import os
+
+from azure.ai.ml import MLClient, dsl
+from azure.ai.projects import AIProjectClient
+from azure.ai.projects.models import PipelineJob
+from azure.identity import DefaultAzureCredential
+from mldesigner import Input as DesignerInput, Output as DesignerOutput, command_component
+
+
+@command_component(name="write_message", environment={"image": os.environ["JOB_ENVIRONMENT_IMAGE"]})
+def write_message(message: str, output: DesignerOutput(type="uri_file")):
+    with open(output, "w", encoding="utf-8") as target:
+        target.write(message)
+
+
+@command_component(name="read_message", environment={"image": os.environ["JOB_ENVIRONMENT_IMAGE"]})
+def read_message(source: DesignerInput(type="uri_file")):
+    with open(source, encoding="utf-8") as saved:
+        print(saved.read())
+
+
+@dsl.pipeline(name="read-after-write")
+def make_pipeline(message: str = "hello"):
+    produced = write_message(message=message)
+    read_message(source=produced.outputs.output)
+
+
+with DefaultAzureCredential() as credential:
+    ml_client = MLClient(
+        credential=credential,
+        subscription_id=os.environ["AML_PROJECT_SUBSCRIPTION_ID"],
+        resource_group_name=os.environ["AML_PROJECT_RESOURCE_GROUP"],
+        workspace_name=os.environ["AML_PROJECT_WORKSPACE_NAME"],
+    )
+    writer_id = ml_client.components.create_or_update(write_message).id
+    reader_id = ml_client.components.create_or_update(read_message).id
+    if not writer_id or not reader_id:
+        raise ValueError("Component registration did not return version IDs")
+
+    with AIProjectClient(endpoint=os.environ["FOUNDRY_PROJECT_ENDPOINT"], credential=credential) as project:
+        job = PipelineJob.from_mldesigner(
+            make_pipeline(),
+            compute_id=os.environ["JOB_COMPUTE_ID"],
+            component_ids={"produced": writer_id, "read_message": reader_id},
+        )
+        created = project.beta.jobs.create_or_update(name="read-after-write", job=job)
+        print(created.id)
+```
+
+This initial adapter supports literal string pipeline inputs and `uri_file` output-to-input bindings between command components with direct container images. It rejects pipeline outputs, data inputs from local paths, additional DSL settings, and non-command nodes rather than forwarding incomplete graph definitions. The resulting Foundry graph references registered component version IDs; it is not an Azure ML `PipelineJob`. End-to-end execution of a registered mldesigner component and multi-step bindings on Foundry has not yet been verified.
+
 ### Performing Responses operations using OpenAI client
 
 Use the `.get_openai_client()` method to obtain an authenticated [OpenAI](https://github.com/openai/openai-python) client and run Responses, Conversations, Evaluations, Files, and Fine-Tuning operations. See the **responses**, **agents**, **evaluations**, **files**, and **finetuning** folders in the [samples][samples] for complete working examples.

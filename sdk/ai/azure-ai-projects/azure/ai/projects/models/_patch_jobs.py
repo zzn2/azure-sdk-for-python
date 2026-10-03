@@ -7,6 +7,7 @@
 
 import datetime
 import json
+import re
 from collections.abc import Mapping
 from os import PathLike
 from pathlib import Path
@@ -27,6 +28,15 @@ from ._models import (
     SystemData,
     TensorFlowDistribution,
 )
+
+_ML_COMPONENT_ID = re.compile(
+    r"(?P<workspace>/subscriptions/[^/]+/resourceGroups/[^/]+/"
+    r"providers/Microsoft\.MachineLearningServices/workspaces/[^/]+)/"
+    r"components/(?P<name>[^/]+)/versions/[^/]+",
+    re.IGNORECASE,
+)
+_DSL_PIPELINE_INPUT = re.compile(r"\$\{\{parent\.inputs\.([^.{}]+)\}\}")
+_DSL_NODE_OUTPUT = re.compile(r"\$\{\{parent\.jobs\.([^.{}]+)\.outputs\.([^.{}]+)\}\}")
 
 
 class CommandJob(_RestCommandJob):
@@ -111,6 +121,8 @@ class PipelineJob(_RestPipelineJob):
     When constructing a pipeline, ``jobs`` accepts raw graph node dictionaries
     or :class:`CommandJob` instances with literal inputs. Command jobs are
     converted to inline command nodes; use raw dictionaries for other features.
+    :meth:`from_mldesigner` converts a limited ``@dsl.pipeline`` graph of
+    ``@mldesigner.command_component`` functions instead.
 
     :ivar name: The name of the job. Read-only; populated after the job is created.
     :vartype name: str or None
@@ -216,6 +228,169 @@ class PipelineJob(_RestPipelineJob):
                 resources["properties"] = job.resources.properties
             node["resources"] = resources
         return node
+
+    @classmethod
+    def from_mldesigner(
+        cls, pipeline: Any, *, compute_id: str, component_ids: Mapping[str, str]
+    ) -> "PipelineJob":
+        """Convert a pipeline built with ``azure.ai.ml.dsl.pipeline`` and mldesigner components.
+
+        Register the decorated command components in the same AML Project first,
+        then supply the returned IDs by pipeline node name. This conversion does
+        not register assets or upload code. Only direct-image command components,
+        string pipeline inputs, and file output-to-input bindings are supported.
+        Pipeline outputs and other Azure ML features are not forwarded to Foundry.
+
+        :param pipeline: An Azure ML PipelineJob built with mldesigner command components.
+        :type pipeline: ~azure.ai.ml.entities.PipelineJob
+        :keyword compute_id: Full resource ID of the Foundry job compute.
+        :paramtype compute_id: str
+        :keyword component_ids: Mapping of pipeline node names to registered
+            component version IDs returned by ``MLClient.components.create_or_update``.
+        :paramtype component_ids: Mapping[str, str]
+        :return: A Foundry PipelineJob ready for ``client.beta.jobs.create_or_update``.
+        :rtype: ~azure.ai.projects.models.PipelineJob
+        :raises ValueError: If the pipeline contains unsupported features or
+            component IDs are missing or invalid.
+        """
+        try:
+            from azure.ai.ml.entities import PipelineJob as MLPipelineJob
+        except ImportError as exc:
+            raise ImportError("Install azure-ai-projects[mldesigner] to convert a DSL pipeline.") from exc
+        if not isinstance(pipeline, MLPipelineJob):
+            raise TypeError("pipeline must be an azure.ai.ml.entities.PipelineJob")
+        if not compute_id:
+            raise ValueError("compute_id must be a Foundry compute resource ID")
+        if not isinstance(component_ids, Mapping):
+            raise TypeError("component_ids must map pipeline node names to registered component version IDs")
+
+        graph = pipeline._to_dict()  # pylint: disable=protected-access
+        cls._check_dsl_fields(graph, {"type", "display_name", "inputs", "outputs", "jobs"}, "Pipeline")
+        if graph.get("type") != "pipeline":
+            raise ValueError("Only DSL pipeline jobs are supported")
+        if graph.get("outputs"):
+            raise ValueError("Pipeline outputs are not supported")
+        inputs = graph.get("inputs") or {}
+        if not isinstance(inputs, dict) or any(
+            not isinstance(value, str) or "${{" in value for value in inputs.values()
+        ):
+            raise ValueError("Pipeline inputs must be literal strings")
+        jobs = graph.get("jobs")
+        if not isinstance(jobs, dict) or not jobs:
+            raise ValueError("Pipeline must have command components")
+        missing = set(jobs) - set(component_ids)
+        extra = set(component_ids) - set(jobs)
+        if missing or extra:
+            raise ValueError(f"component_ids must match pipeline nodes (missing: {sorted(missing)}, extra: {sorted(extra)})")
+
+        nodes: Dict[str, Any] = {}
+        workspaces = set()
+        for name, node in jobs.items():
+            nodes[name] = cls._mldesigner_node(name, node, component_ids[name], inputs, jobs)
+            workspaces.add(component_ids[name].casefold().rsplit("/components/", 1)[0])
+        if len(workspaces) != 1:
+            raise ValueError("All component_ids must belong to the same AML Project workspace")
+        return cls(
+            display_name=graph.get("display_name"),
+            compute_id=compute_id,
+            settings={"default_compute": compute_id},
+            inputs={name: Input(type="literal", value=value) for name, value in inputs.items()},
+            outputs={},
+            jobs=nodes,
+        )
+
+    @staticmethod
+    def _check_dsl_fields(value: Any, allowed: set, label: str) -> None:
+        if not isinstance(value, Mapping):
+            raise ValueError(f"{label} must be a mapping")
+        extra = set(value) - allowed
+        if extra:
+            raise ValueError(f"{label} has unsupported fields {sorted(extra)}")
+
+    @classmethod
+    def _mldesigner_node(
+        cls, name: str, node: Any, component_id: str, pipeline_inputs: dict, jobs: dict
+    ) -> Dict[str, Any]:
+        cls._check_dsl_fields(node, {"type", "component", "inputs", "outputs"}, f"Pipeline node '{name}'")
+        if node.get("type") != "command" or node.get("outputs"):
+            raise ValueError(f"Pipeline node '{name}' must be a command without pipeline output bindings")
+        component = node.get("component")
+        cls._check_dsl_fields(
+            component,
+            {"name", "version", "display_name", "type", "command", "code", "environment", "inputs", "outputs",
+             "tags", "is_deterministic"},
+            f"Pipeline component '{name}'",
+        )
+        if (
+            component.get("type") != "command"
+            or component.get("tags") != {"codegenBy": "mldesigner"}
+            or component.get("is_deterministic") is False
+            or component.get("display_name") not in (None, component.get("name"))
+        ):
+            raise ValueError(f"Pipeline component '{name}' must be an mldesigner command component")
+        command = component.get("command")
+        if not isinstance(command, str) or not command.startswith("mldesigner execute --source "):
+            raise ValueError(f"Pipeline component '{name}' must use the mldesigner execution command")
+        code = component.get("code")
+        if not isinstance(code, str) or not Path(code).is_dir():
+            raise ValueError(f"Pipeline component '{name}' must have an existing local code directory")
+        component_name = component.get("name")
+        registered = _ML_COMPONENT_ID.fullmatch(component_id) if isinstance(component_id, str) else None
+        if (
+            not isinstance(component_name, str)
+            or not registered
+            or registered.group("name").casefold() != component_name.casefold()
+        ):
+            raise ValueError(f"Pipeline component '{name}' requires its own registered AML Project component version ID")
+        environment = component.get("environment")
+        cls._check_dsl_fields(environment, {"image", "name", "version"}, f"Pipeline component '{name}' environment")
+        if not isinstance(environment.get("image"), str) or not environment["image"]:
+            raise ValueError(f"Pipeline component '{name}' requires a direct container image")
+        if environment.get("name") not in (None, "CliV2AnonymousEnvironment"):
+            raise ValueError(f"Pipeline component '{name}' requires an inline environment")
+        component_inputs = component.get("inputs") or {}
+        component_outputs = component.get("outputs") or {}
+        if not isinstance(component_inputs, dict) or not isinstance(component_outputs, dict):
+            raise ValueError(f"Pipeline component '{name}' inputs and outputs must be mappings")
+        for port, definition in component_inputs.items():
+            cls._check_dsl_fields(definition, {"type"}, f"Pipeline component '{name}' input '{port}'")
+            if definition.get("type") not in ("string", "uri_file"):
+                raise ValueError(f"Pipeline component '{name}' input '{port}' has an unsupported type")
+        for port, definition in component_outputs.items():
+            cls._check_dsl_fields(definition, {"type"}, f"Pipeline component '{name}' output '{port}'")
+            if definition.get("type") != "uri_file":
+                raise ValueError(f"Pipeline component '{name}' output '{port}' has an unsupported type")
+        bindings = node.get("inputs") or {}
+        cls._check_dsl_fields(bindings, set(component_inputs), f"Pipeline node '{name}' inputs")
+        if set(bindings) != set(component_inputs):
+            raise ValueError(f"Pipeline node '{name}' must bind all declared inputs")
+        converted_inputs: Dict[str, Any] = {}
+        for port, value in bindings.items():
+            input_type = component_inputs[port]["type"]
+            is_path = isinstance(value, Mapping)
+            if isinstance(value, Mapping):
+                cls._check_dsl_fields(value, {"path"}, f"Pipeline node '{name}' input '{port}'")
+                value = value.get("path")
+            if not isinstance(value, str):
+                raise ValueError(f"Pipeline node '{name}' input '{port}' must be a string or a supported binding")
+            if "${{" in value or "}}" in value:
+                pipeline_ref = _DSL_PIPELINE_INPUT.fullmatch(value)
+                output_ref = _DSL_NODE_OUTPUT.fullmatch(value)
+                if pipeline_ref and pipeline_ref.group(1) in pipeline_inputs and input_type == "string":
+                    pass
+                elif output_ref and output_ref.group(1) in jobs and output_ref.group(1) != name:
+                    source_job = jobs[output_ref.group(1)]
+                    source = source_job.get("component") if isinstance(source_job, Mapping) else None
+                    source_outputs = source.get("outputs") if isinstance(source, Mapping) else None
+                    output = source_outputs.get(output_ref.group(2)) if isinstance(source_outputs, Mapping) else None
+                    if not isinstance(output, Mapping) or output.get("type") != input_type:
+                        raise ValueError(f"Pipeline node '{name}' input '{port}' has an unknown or mismatched output")
+                else:
+                    raise ValueError(f"Pipeline node '{name}' input '{port}' has an unsupported binding")
+            elif is_path or input_type != "string":
+                raise ValueError(f"Pipeline node '{name}' input '{port}' must bind an output or be a literal string")
+            converted_inputs[port] = {"job_input_type": "literal", "value": value}
+        return {"type": "command", "component": component_id, "inputs": converted_inputs, "outputs": {}}
 
     @property
     def name(self) -> Optional[str]:

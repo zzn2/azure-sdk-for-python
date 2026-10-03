@@ -73,6 +73,10 @@ _INLINE_PIPELINE_PROPERTIES = {
             "inputs": {"name": {"job_input_type": "literal", "value": "${{parent.inputs.name}}"}},
             "outputs": {},
         }
+        _COMPONENT_PREFIX = (
+            "/subscriptions/test/resourceGroups/test/providers/Microsoft.MachineLearningServices/"
+            "workspaces/fake-project/components"
+        )
     },
 }
 
@@ -235,6 +239,146 @@ def _inline_pipeline() -> tuple[PipelineJob, CommandJob]:
         jobs={"hello": command},
     )
     return pipeline, command
+
+
+def _dsl_pipeline() -> Any:
+    designer = pytest.importorskip("mldesigner")
+    dsl = pytest.importorskip("azure.ai.ml").dsl
+
+    @designer.command_component(name="produce", environment={"image": "example.azurecr.io/test:latest"})
+    def produce(message: str, output: designer.Output(type="uri_file")):
+        with open(output, "w", encoding="utf-8") as target:
+            target.write(message)
+
+    @designer.command_component(name="consume", environment={"image": "example.azurecr.io/test:latest"})
+    def consume(source: designer.Input(type="uri_file")):
+        with open(source, encoding="utf-8") as saved:
+            print(saved.read())
+
+    @dsl.pipeline(name="dsl-demo")
+    def example(message: str = "world"):
+        produced = produce(message=message)
+        consumed = consume(source=produced.outputs.output)
+
+    return example()
+
+
+def _component_ids() -> dict[str, str]:
+    return {
+        "produced": f"{_COMPONENT_PREFIX}/produce/versions/1",
+        "consumed": f"{_COMPONENT_PREFIX}/consume/versions/1",
+    }
+
+
+_DSL_PIPELINE_PROPERTIES = {
+    "jobType": "Pipeline",
+    "displayName": "dsl-demo",
+    "computeId": _COMPUTE,
+    "settings": {"default_compute": _COMPUTE},
+    "inputs": {"message": {"jobInputType": "literal", "value": "world"}},
+    "outputs": {},
+    "jobs": {
+        "produced": {
+            "type": "command",
+            "component": _component_ids()["produced"],
+            "inputs": {"message": {"job_input_type": "literal", "value": "${{parent.inputs.message}}"}},
+            "outputs": {},
+        },
+        "consumed": {
+            "type": "command",
+            "component": _component_ids()["consumed"],
+            "inputs": {"source": {"job_input_type": "literal", "value": "${{parent.jobs.produced.outputs.output}}"}},
+            "outputs": {},
+        },
+    },
+}
+
+
+def test_pipeline_converts_mldesigner_graph_with_registered_components() -> None:
+    aml_job = _dsl_pipeline()
+    pipeline = PipelineJob.from_mldesigner(aml_job, compute_id=_COMPUTE, component_ids=_component_ids())
+    assert pipeline.as_dict(exclude_readonly=True) == _DSL_PIPELINE_PROPERTIES
+    assert "code" not in json.dumps(pipeline.as_dict(exclude_readonly=True))
+
+    transport = _Transport([_response("Pipeline")])
+    with AIProjectClient(endpoint=_ENDPOINT, credential=_Credential(), transport=transport) as client:  # type: ignore[arg-type]
+        client.beta.jobs.create_or_update("dsl-demo", pipeline)
+
+    assert len(transport.requests) == 1
+    assert json.loads(transport.requests[0].body) == {"properties": _DSL_PIPELINE_PROPERTIES}
+
+
+@pytest.mark.asyncio
+async def test_pipeline_async_submits_mldesigner_graph_without_uploading_code() -> None:
+    pipeline = PipelineJob.from_mldesigner(_dsl_pipeline(), compute_id=_COMPUTE, component_ids=_component_ids())
+    transport = _AsyncTransport([_response("Pipeline")])
+    async with AsyncAIProjectClient(
+        endpoint=_ENDPOINT, credential=_AsyncCredential(), transport=transport  # type: ignore[arg-type]
+    ) as client:
+        await client.beta.jobs.create_or_update("dsl-demo", pipeline)
+
+    assert len(transport.requests) == 1
+    assert json.loads(transport.requests[0].body) == {"properties": _DSL_PIPELINE_PROPERTIES}
+
+
+@pytest.mark.parametrize(
+    ("ids", "message"),
+    [
+        ({"produced": f"{_COMPONENT_PREFIX}/produce/versions/1"}, "missing: \\['consumed'\\]"),
+        ({**_component_ids(), "extra": f"{_COMPONENT_PREFIX}/extra/versions/1"}, "extra: \\['extra'\\]"),
+        ({**_component_ids(), "consumed": ""}, "registered AML Project component version ID"),
+        ({**_component_ids(), "consumed": "/subscriptions/test/datasets/consume/versions/1"}, "registered AML Project"),
+        ({**_component_ids(), "consumed": f"{_COMPONENT_PREFIX}/produce/versions/1"}, "its own registered"),
+        (
+            {**_component_ids(), "consumed": _component_ids()["consumed"].replace("fake-project", "other-project")},
+            "same AML Project workspace",
+        ),
+    ],
+)
+def test_pipeline_dsl_rejects_missing_or_wrong_registered_ids(ids: dict[str, str], message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        PipelineJob.from_mldesigner(_dsl_pipeline(), compute_id=_COMPUTE, component_ids=ids)
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        (lambda graph: graph.update({"outputs": {"result": {"type": "uri_file"}}}), "Pipeline outputs"),
+        (lambda graph: graph.update({"settings": {"force_rerun": True}}), "unsupported fields"),
+        (lambda graph: graph["jobs"]["produced"].update({"type": "sweep"}), "must be a command"),
+        (
+            lambda graph: graph["jobs"]["produced"]["component"].update({"code": "./missing-directory"}),
+            "existing local code directory",
+        ),
+        (
+            lambda graph: graph["jobs"]["produced"]["component"].update({"inputs": {"message": {"type": "integer"}}}),
+            "unsupported type",
+        ),
+        (
+            lambda graph: graph["jobs"]["consumed"]["inputs"]["source"].update(
+                {"path": "${{parent.jobs.produced.outputs.other}}"}
+            ),
+            "unknown or mismatched output",
+        ),
+        (
+            lambda graph: graph["jobs"]["consumed"]["inputs"]["source"].update({"path": "./local-file"}),
+            "must bind an output",
+        ),
+        (
+            lambda graph: graph["jobs"]["consumed"].update({"component": "../consume/consume.yaml"}),
+            "must be a mapping",
+        ),
+    ],
+)
+def test_pipeline_dsl_rejects_unmapped_features(
+    monkeypatch: pytest.MonkeyPatch, change: Any, message: str
+) -> None:
+    aml_job = _dsl_pipeline()
+    graph = aml_job._to_dict()
+    change(graph)
+    monkeypatch.setattr(aml_job, "_to_dict", lambda: graph)
+    with pytest.raises(ValueError, match=message):
+        PipelineJob.from_mldesigner(aml_job, compute_id=_COMPUTE, component_ids=_component_ids())
 
 
 def _assert_inline_request(request: HttpRequest) -> None:

@@ -341,7 +341,7 @@ class JobsOperations(_GeneratedJobsOps):
         :param job: The Command or Pipeline job to create or update. Required.
         :type job: ~azure.ai.projects.models.CommandJob or ~azure.ai.projects.models.PipelineJob
         :keyword skip_validation: If ``True``, skip local CommandJob validation.
-            PipelineJob is submitted as-is. Defaults to ``False``.
+            PipelineJob graphs are submitted as-is. Defaults to ``False``.
         :paramtype skip_validation: bool
         :return: The created/updated job.
         :rtype: ~azure.ai.projects.models.CommandJob or ~azure.ai.projects.models.PipelineJob

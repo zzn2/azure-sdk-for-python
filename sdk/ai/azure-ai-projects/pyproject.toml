@@ -46,6 +46,7 @@ dynamic = [
 
 [project.optional-dependencies]
 yaml = ["pyyaml>=6.0"]
+mldesigner = ["mldesigner[pipeline]>=0.1.0b23", "azure-ai-ml>=1.34.0,<2"]
 
 [project.urls]
 repository = "https://aka.ms/azsdk/azure-ai-projects-v2/python/code"
@@ -73,4 +74,3 @@ verifytypes = false
 
 [tool.azure-sdk-conda]
 in_bundle = false
-
