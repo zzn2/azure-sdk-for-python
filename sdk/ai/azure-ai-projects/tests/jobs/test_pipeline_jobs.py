@@ -253,7 +253,9 @@ def _code_folder(tmp_path: Path) -> Path:
     return folder
 
 
-def _mock_code_upload(monkeypatch: pytest.MonkeyPatch, operations: Any, *, async_upload: bool = False) -> tuple[Mock, Mock]:
+def _mock_code_upload(
+    monkeypatch: pytest.MonkeyPatch, operations: Any, *, async_upload: bool = False
+) -> tuple[Mock, Mock]:
     mock_type = AsyncMock if async_upload else Mock
     get = mock_type(side_effect=ResourceNotFoundError("dataset not found"))
 
@@ -359,9 +361,7 @@ async def test_jobs_async_uploads_composed_command_code(monkeypatch: pytest.Monk
     assert command.code == str(folder)
 
 
-def test_pipeline_raw_graph_code_passes_through_without_upload(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_pipeline_raw_graph_code_passes_through_without_upload(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     folder = _code_folder(tmp_path)
     pipeline = PipelineJob(compute_id=_COMPUTE, jobs={"raw": {"type": "command", "component": {"code": str(folder)}}})
     transport = _Transport([_response("Pipeline")])
@@ -381,7 +381,10 @@ def test_pipeline_raw_graph_code_passes_through_without_upload(
 def test_jobs_sync_command_code_keeps_code_id(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     folder = _code_folder(tmp_path)
     command = CommandJob(
-        command="echo hello", code=str(folder), environment_image_reference="example.azurecr.io/train:latest", compute=_COMPUTE
+        command="echo hello",
+        code=str(folder),
+        environment_image_reference="example.azurecr.io/train:latest",
+        compute=_COMPUTE,
     )
     transport = _Transport([_response("Command")])
 
@@ -401,7 +404,10 @@ def test_jobs_sync_command_code_keeps_code_id(monkeypatch: pytest.MonkeyPatch, t
 async def test_jobs_async_command_code_keeps_code_id(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     folder = _code_folder(tmp_path)
     command = CommandJob(
-        command="echo hello", code=str(folder), environment_image_reference="example.azurecr.io/train:latest", compute=_COMPUTE
+        command="echo hello",
+        code=str(folder),
+        environment_image_reference="example.azurecr.io/train:latest",
+        compute=_COMPUTE,
     )
     transport = _AsyncTransport([_response("Command")])
 
