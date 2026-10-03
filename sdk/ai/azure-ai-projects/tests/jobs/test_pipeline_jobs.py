@@ -73,12 +73,12 @@ _INLINE_PIPELINE_PROPERTIES = {
             "inputs": {"name": {"job_input_type": "literal", "value": "${{parent.inputs.name}}"}},
             "outputs": {},
         }
-        _COMPONENT_PREFIX = (
-            "/subscriptions/test/resourceGroups/test/providers/Microsoft.MachineLearningServices/"
-            "workspaces/fake-project/components"
-        )
     },
 }
+_COMPONENT_PREFIX = (
+    "/subscriptions/test/resourceGroups/test/providers/Microsoft.MachineLearningServices/"
+    "workspaces/fake-project/components"
+)
 
 
 class _Credential:
