@@ -579,7 +579,9 @@ async def test_pipeline_uploads_both_local_code_folders_async(
 def test_pipeline_decorator_rejects_duplicate_node_names() -> None:
     @dsl.command
     def produce() -> CommandJob:
-        return CommandJob(command="echo hello", environment_image_reference="example.azurecr.io/image", compute=_COMPUTE)
+        return CommandJob(
+            command="echo hello", environment_image_reference="example.azurecr.io/image", compute=_COMPUTE
+        )
 
     @dsl.pipeline(display_name="duplicate nodes", compute_id=_COMPUTE, settings={})
     def workflow() -> None:
@@ -611,7 +613,9 @@ def test_pipeline_decorator_rejects_undeclared_outputs() -> None:
 def test_pipeline_decorator_isolates_builds_after_errors() -> None:
     @dsl.command
     def produce() -> CommandJob:
-        return CommandJob(command="echo hello", environment_image_reference="example.azurecr.io/image", compute=_COMPUTE)
+        return CommandJob(
+            command="echo hello", environment_image_reference="example.azurecr.io/image", compute=_COMPUTE
+        )
 
     fail = True
 
