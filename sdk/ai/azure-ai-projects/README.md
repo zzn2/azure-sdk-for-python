@@ -127,6 +127,10 @@ For comprehensive examples covering Agents, tool usage, evaluation, fine-tuning,
 
 The sections below cover SDK-specific behaviors (authentication variants, exception handling, logging, tracing) that are not documented in the above Learn pages.
 
+### Decorator-based Pipeline Jobs (preview)
+
+`from azure.ai.projects import dsl` exposes `@dsl.command` for factories returning SDK `CommandJob` objects and `@dsl.pipeline(display_name=..., compute_id=..., settings=...)` for a zero-argument workflow. Calling a decorated command inside the workflow registers a node under its factory name, even if the call's result is discarded. Accessing a declared output such as `produced.outputs.message` returns the string `${{parent.jobs.produce.outputs.message}}` for use in an SDK `Input`; unknown output names and duplicate node names raise errors. The workflow returns an SDK `PipelineJob` for `.beta.jobs.create_or_update`, which uploads each node's local code folder through the existing code-asset path.
+
 ### Performing Responses operations using OpenAI client
 
 Use the `.get_openai_client()` method to obtain an authenticated [OpenAI](https://github.com/openai/openai-python) client and run Responses, Conversations, Evaluations, Files, and Fine-Tuning operations. See the **responses**, **agents**, **evaluations**, **files**, and **finetuning** folders in the [samples][samples] for complete working examples.

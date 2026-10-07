@@ -21,15 +21,17 @@ from azure.core.pipeline.transport import (
     HttpTransport,
 )
 
-from azure.ai.projects import AIProjectClient
+from azure.ai.projects import AIProjectClient, dsl
 from azure.ai.projects.aio import AIProjectClient as AsyncAIProjectClient
 from azure.ai.projects.models import (
     AssetTypes,
     CommandJob,
     DatasetVersion,
     Input,
+    InputOutputModes,
     JobResourceConfiguration,
     JobType,
+    Output,
     PipelineJob,
 )
 
@@ -273,6 +275,63 @@ def _two_code_job(tmp_path: Path) -> tuple[PipelineJob, dict[str, Path]]:
     return job, code_dirs
 
 
+def _decorated_two_code_job(tmp_path: Path) -> tuple[PipelineJob, dict[str, Path]]:
+    explicit, code_dirs = _two_code_job(tmp_path)
+    resources = JobResourceConfiguration(
+        {
+            "instanceCount": 1,
+            "instanceType": "Singularity.D4_v3",
+            "properties": {"AISuperComputer": {"SLATier": "Premium"}},
+        }
+    )
+
+    @dsl.command
+    def produce() -> CommandJob:
+        return CommandJob(
+            command="python produce.py ${{outputs.message}}",
+            code=str(code_dirs["produce"]),
+            environment_image_reference="example.azurecr.io/train:latest",
+            compute=_COMPUTE,
+            user_assigned_identity_id="/subscriptions/test/identities/hello",
+            resources=resources,
+            outputs={
+                "message": Output(
+                    type=AssetTypes.URI_FILE,
+                    asset_name="message",
+                    mode=InputOutputModes.READ_WRITE_MOUNT,
+                )
+            },
+        )
+
+    @dsl.command
+    def consume(message: Input) -> CommandJob:
+        return CommandJob(
+            command="python consume.py ${{inputs.message}}",
+            code=str(code_dirs["consume"]),
+            environment_image_reference="example.azurecr.io/train:latest",
+            compute=_COMPUTE,
+            user_assigned_identity_id="/subscriptions/test/identities/hello",
+            resources=resources,
+            inputs={"message": message},
+        )
+
+    @dsl.pipeline(
+        display_name="Two-step code decorator SDK test",
+        compute_id=_COMPUTE,
+        settings={"default_compute": _COMPUTE, "force_rerun": True},
+    )
+    def workflow() -> None:
+        produced = produce()
+        assert type(produced.outputs.message) is str
+        consume(message=Input(type=AssetTypes.URI_FILE, value=produced.outputs.message))
+
+    decorated = workflow()
+    expected = explicit.as_dict(exclude_readonly=True)
+    expected["displayName"] = "Two-step code decorator SDK test"
+    assert decorated.as_dict(exclude_readonly=True) == expected
+    return decorated, code_dirs
+
+
 def _code_uri(name: str, version: str) -> str:
     return f"azureai://accounts/fake-account/projects/fake-project/data/{name}/versions/{version}"
 
@@ -289,7 +348,9 @@ def _uploaded_code(name: str, version: str) -> DatasetVersion:
     )
 
 
-def _assert_two_code_request(request: HttpRequest, code_uris: dict[str, str]) -> None:
+def _assert_two_code_request(
+    request: HttpRequest, code_uris: dict[str, str], display_name: str = "Two-step code SDK test"
+) -> None:
     assert request.method == "PUT"
     assert request.headers["Foundry-Features"] == "Jobs=V1Preview"
     assert request.headers["x-ms-foundry-job-route"] == "execution"
@@ -303,7 +364,7 @@ def _assert_two_code_request(request: HttpRequest, code_uris: dict[str, str]) ->
     expected = {
         "properties": {
             "jobType": "Pipeline",
-            "displayName": "Two-step code SDK test",
+            "displayName": display_name,
             "computeId": _COMPUTE,
             "settings": {"default_compute": _COMPUTE, "force_rerun": True},
             "inputs": {},
@@ -427,8 +488,11 @@ def test_pipeline_composes_commands_and_preserves_raw_graph_nodes() -> None:
     assert first.jobs["hello"] == _INLINE_PIPELINE_PROPERTIES["jobs"]["hello"]
 
 
-def test_pipeline_uploads_both_local_code_folders(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    pipeline, code_dirs = _two_code_job(tmp_path)
+@pytest.mark.parametrize("decorated", [False, True])
+def test_pipeline_uploads_both_local_code_folders(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, decorated: bool
+) -> None:
+    pipeline, code_dirs = _decorated_two_code_job(tmp_path) if decorated else _two_code_job(tmp_path)
     transport = _Transport([_response("Pipeline")])
     uploads: list[tuple[str, str, str]] = []
 
@@ -463,12 +527,16 @@ def test_pipeline_uploads_both_local_code_folders(tmp_path: Path, monkeypatch: p
             name.removeprefix("two-code-").removesuffix("-code"): _code_uri(name, version)
             for name, version, _ in uploads
         },
+        display_name="Two-step code decorator SDK test" if decorated else "Two-step code SDK test",
     )
 
 
 @pytest.mark.asyncio
-async def test_pipeline_uploads_both_local_code_folders_async(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    pipeline, code_dirs = _two_code_job(tmp_path)
+@pytest.mark.parametrize("decorated", [False, True])
+async def test_pipeline_uploads_both_local_code_folders_async(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, decorated: bool
+) -> None:
+    pipeline, code_dirs = _decorated_two_code_job(tmp_path) if decorated else _two_code_job(tmp_path)
     transport = _AsyncTransport([_response("Pipeline")])
     uploads: list[tuple[str, str, str]] = []
 
@@ -504,7 +572,62 @@ async def test_pipeline_uploads_both_local_code_folders_async(tmp_path: Path, mo
             name.removeprefix("two-code-").removesuffix("-code"): _code_uri(name, version)
             for name, version, _ in uploads
         },
+        display_name="Two-step code decorator SDK test" if decorated else "Two-step code SDK test",
     )
+
+
+def test_pipeline_decorator_rejects_duplicate_node_names() -> None:
+    @dsl.command
+    def produce() -> CommandJob:
+        return CommandJob(command="echo hello", environment_image_reference="example.azurecr.io/image", compute=_COMPUTE)
+
+    @dsl.pipeline(display_name="duplicate nodes", compute_id=_COMPUTE, settings={})
+    def workflow() -> None:
+        produce()
+        produce()
+
+    with pytest.raises(ValueError, match="Pipeline node 'produce' is already registered"):
+        workflow()
+
+
+def test_pipeline_decorator_rejects_undeclared_outputs() -> None:
+    @dsl.command
+    def produce() -> CommandJob:
+        return CommandJob(
+            command="echo hello",
+            environment_image_reference="example.azurecr.io/image",
+            compute=_COMPUTE,
+            outputs={"message": Output(type=AssetTypes.URI_FILE, asset_name="message")},
+        )
+
+    @dsl.pipeline(display_name="unknown output", compute_id=_COMPUTE, settings={})
+    def workflow() -> None:
+        produce().outputs.unknown
+
+    with pytest.raises(AttributeError, match="Pipeline node 'produce' does not declare output 'unknown'"):
+        workflow()
+
+
+def test_pipeline_decorator_isolates_builds_after_errors() -> None:
+    @dsl.command
+    def produce() -> CommandJob:
+        return CommandJob(command="echo hello", environment_image_reference="example.azurecr.io/image", compute=_COMPUTE)
+
+    fail = True
+
+    @dsl.pipeline(display_name="isolated builds", compute_id=_COMPUTE, settings={})
+    def workflow() -> None:
+        produce()
+        if fail:
+            raise RuntimeError("construction failed")
+
+    with pytest.raises(RuntimeError, match="construction failed"):
+        workflow()
+    fail = False
+    assert set(workflow().jobs or {}) == {"produce"}
+    assert set(workflow().jobs or {}) == {"produce"}
+    with pytest.raises(RuntimeError, match="inside a @dsl.pipeline"):
+        produce()
 
 
 def test_pipeline_does_not_submit_when_code_upload_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
