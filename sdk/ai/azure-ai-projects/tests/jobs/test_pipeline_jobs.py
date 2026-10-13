@@ -988,7 +988,7 @@ def test_dsl_folder_handoff_with_pipeline_file_input_and_output(tmp_path: Path) 
             capture_output=True,
             text=True,
         )
-        assert receipt.read_bytes() == b"HELLO FOUNDRY\n"
+        assert receipt.read_text(encoding="utf-8") == "HELLO FOUNDRY\n"
     finally:
         for directory in job._component_code_dirs:
             directory.cleanup()
