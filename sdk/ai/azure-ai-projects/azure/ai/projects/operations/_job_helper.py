@@ -17,6 +17,7 @@ from typing import (
     Callable,
     Dict,
     Iterable,
+    Iterator,
     List,
     Optional,
     Set,
@@ -177,6 +178,31 @@ def _collect_files(directory: Path, ignore_patterns: List[str]) -> List[Tuple[Pa
             if not _is_excluded(rel_path, ignore_patterns):
                 files.append((_resolve_symlink(abs_path), rel_path))
     return sorted(files, key=lambda x: x[1].lower())
+
+
+def _iter_pipeline_command_components(
+    jobs: Dict[str, Any], prefix: str = ""
+) -> Iterator[Tuple[str, Dict[str, Any]]]:
+    """Yield inline command components, including those inside Pipeline components.
+
+    :param jobs: Graph nodes to traverse.
+    :type jobs: dict[str, Any]
+    :param prefix: Ancestor node names used to qualify nested nodes.
+    :type prefix: str
+    :returns: Qualified node names and their inline component dictionaries.
+    :rtype: Iterator[tuple[str, dict[str, Any]]]
+    """
+    for name, node in jobs.items():
+        if not isinstance(node, dict):
+            continue
+        component = node.get("component")
+        if not isinstance(component, dict):
+            continue
+        node_name = f"{prefix}-{name}" if prefix else name
+        if node.get("type") == "command":
+            yield node_name, component
+        elif node.get("type") == "pipeline" and isinstance(component.get("jobs"), dict):
+            yield from _iter_pipeline_command_components(component["jobs"], node_name)
 
 
 def _content_hash(path: Path) -> str:

@@ -187,6 +187,13 @@ builder. Submit it with `client.pipeline_jobs.create_or_update(job)` for an auto
 optionally passing `experiment_name="pipeline_samples"`, or use the existing
 `create_or_update(name=..., job=...)` form.
 
+Call one decorated `@pipeline` function from another to add a nested Pipeline node,
+then connect its exported outputs through `stage.outputs.<name>` just like command
+outputs. The nested graph is preserved, not flattened; its commands bind to their own
+pipeline inputs and exported outputs. See the [nested pipeline sample](https://github.com/Azure/azure-sdk-for-python/blob/main/sdk/ai/azure-ai-projects/samples/jobs/sample_pipeline_nested.py).
+If the nested decorator selects a different compute resource ID, its Pipeline invocation retains that selection instead of inheriting the parent default.
+Submission requires a service version supporting inline Pipeline component registration.
+
 See the [two-component Python sample](https://github.com/Azure/azure-sdk-for-python/blob/main/sdk/ai/azure-ai-projects/samples/jobs/sample_pipeline_dsl.py) for a producer and
 consumer connected through a mounted file. Each function body is packaged into a separate Code
 folder and runs on the selected compute, not when the graph is built. Component functions must be
@@ -203,7 +210,9 @@ its undecorated function, so module globals, sibling Python files, and resources
 root are available. Define components in import-safe modules separate from submission-time
 configuration. The selected image must contain a compatible `azure-ai-projects` version and
 any other imported Python packages; the snapshot does not install dependencies or capture
-closure values. Shared code roots are uploaded once per pipeline submission.
+closure values. Shared code roots are uploaded once per pipeline submission, including
+across nested pipelines. The root job owns all staged Code folders and cleans them up
+after code resolution, including when a nested upload fails.
 The snapshot honors `.amlignore` (or `.gitignore` when no `.amlignore` exists) in each directory,
 always omits `.env` files and common Python/Git artifacts, and rejects included symlinks.
 Review the code root before submitting: only files not excluded by these rules are uploaded.
