@@ -894,6 +894,56 @@ def test_dsl_nested_pipeline_accepts_parent_node_outputs_and_repeated_calls() ->
             directory.cleanup()
 
 
+@pytest.mark.parametrize("surface", ["jobs", "pipeline_jobs"])
+@pytest.mark.parametrize("different_compute", [False, True], ids=["inherited", "explicit"])
+def test_dsl_nested_pipeline_preserves_compute(
+    monkeypatch: pytest.MonkeyPatch, surface: str, different_compute: bool
+) -> None:
+    inner_compute = _COMPUTE + "-nested" if different_compute else _COMPUTE
+
+    @dsl.component
+    def write(text: str, message: dsl.Output(type="uri_file")) -> None:
+        Path(message).write_text(text, encoding="utf-8")
+
+    @dsl.pipeline(**{**_DSL_RUNTIME, "compute_id": inner_compute})
+    def text_subgraph(text: str):
+        return {"message": write(text=text).outputs.message}
+
+    @dsl.pipeline(**_DSL_RUNTIME)
+    def workflow(text: str):
+        return {"receipt": text_subgraph(text=text).outputs.message}
+
+    job = workflow(text="hello")
+    paths = _dsl_code_paths(job)
+    transport = _Transport([_response("Pipeline")])
+
+    def get(*, name: str, version: str) -> DatasetVersion:
+        return _uploaded_code(name, version)
+
+    try:
+        assert job.compute_id == _COMPUTE
+        assert job.settings["default_compute"] == _COMPUTE
+        stage = job.jobs["text_subgraph"]
+        expected_compute = {"compute": inner_compute} if different_compute else {}
+        assert {key: value for key, value in stage.items() if key == "compute"} == expected_compute
+        assert "compute" not in stage["component"]["jobs"]["write"]
+        with AIProjectClient(
+            endpoint=_ENDPOINT, credential=_Credential(), transport=transport  # type: ignore[arg-type]
+        ) as client:
+            operations = client.beta.jobs if surface == "jobs" else client.pipeline_jobs
+            monkeypatch.setattr(operations._datasets, "get", get)
+            operations.create_or_update(name="nested-compute", job=job)
+        properties = json.loads(transport.requests[0].body)["properties"]
+        wire_stage = properties["jobs"]["text_subgraph"]
+        assert {key: value for key, value in wire_stage.items() if key == "compute"} == expected_compute
+        assert properties["computeId"] == _COMPUTE
+        assert properties["settings"]["default_compute"] == _COMPUTE
+        assert all(not path.exists() for path in paths.values())
+    finally:
+        for directory in job._component_code_dirs:
+            directory.cleanup()
+
+
 def test_dsl_nested_authoring_failures_preserve_parent_sources_and_cleanup_new_directories(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

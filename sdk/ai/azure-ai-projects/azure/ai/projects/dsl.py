@@ -184,7 +184,7 @@ class _PipelineContext:
         outputs: List[_Port],
         arguments: Dict[str, Any],
         source: Optional[_ComponentSource],
-        jobs: Optional[Dict[str, Any]] = None,
+        pipeline_context: Optional["_PipelineContext"] = None,
     ) -> SimpleNamespace:
         name = func.__name__
         suffix = 2
@@ -212,7 +212,7 @@ class _PipelineContext:
             input_type = port.type if port.type in _DATA_PORT_TYPES else AssetTypes.LITERAL
             bound_inputs[port.name] = Input(type=input_type, value=serialized)
 
-        if jobs is not None:
+        if pipeline_context is not None:
             node: Dict[str, Any] = {
                 "type": "pipeline",
                 "component": {
@@ -221,7 +221,7 @@ class _PipelineContext:
                     "type": "pipeline",
                     "inputs": {port.name: {"type": port.type} for port in inputs},
                     "outputs": {port.name: {"type": port.type} for port in outputs},
-                    "jobs": jobs,
+                    "jobs": pipeline_context.jobs,
                 },
                 "inputs": {
                     port_name: {"job_input_type": "literal", "value": value.value}
@@ -232,6 +232,8 @@ class _PipelineContext:
                     for port in outputs
                 },
             }
+            if pipeline_context.compute_id != self.compute_id:
+                node["compute"] = pipeline_context.compute_id
         else:
             arguments_in_command = " ".join(
                 [f'"${{{{inputs.{port.name}}}}}"' for port in inputs]
@@ -361,7 +363,8 @@ def pipeline(
 
     Compute, image, identity, and instance type are inherited by each command node.
     Calling it inside another pipeline adds a nested Pipeline component and returns
-    parent-owned output references instead of a standalone job.
+    parent-owned output references instead of a standalone job. A different nested
+    compute resource ID is retained on that Pipeline node.
 
     :keyword compute_id: Compute resource ID inherited by the pipeline nodes.
     :paramtype compute_id: str
@@ -464,7 +467,9 @@ def pipeline(
                     )
                     job._component_code_dirs = context.code_dirs  # pylint: disable=protected-access
                 else:
-                    node = parent.add(func, input_ports, output_ports, dict(bound.arguments), None, jobs=context.jobs)
+                    node = parent.add(
+                        func, input_ports, output_ports, dict(bound.arguments), None, pipeline_context=context
+                    )
                     parent.code_dirs.extend(context.code_dirs)
                     parent.code_dirs_by_root.update(context.code_dirs_by_root)
                     job = node

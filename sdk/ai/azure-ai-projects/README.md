@@ -191,6 +191,7 @@ Call one decorated `@pipeline` function from another to add a nested Pipeline no
 then connect its exported outputs through `stage.outputs.<name>` just like command
 outputs. The nested graph is preserved, not flattened; its commands bind to their own
 pipeline inputs and exported outputs. See the [nested pipeline sample](https://github.com/Azure/azure-sdk-for-python/blob/main/sdk/ai/azure-ai-projects/samples/jobs/sample_pipeline_nested.py).
+If the nested decorator selects a different compute resource ID, its Pipeline invocation retains that selection instead of inheriting the parent default.
 Submission requires a service version supporting inline Pipeline component registration.
 
 See the [two-component Python sample](https://github.com/Azure/azure-sdk-for-python/blob/main/sdk/ai/azure-ai-projects/samples/jobs/sample_pipeline_dsl.py) for a producer and
