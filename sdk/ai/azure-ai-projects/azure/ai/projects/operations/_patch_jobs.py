@@ -49,6 +49,7 @@ from ._job_helper import (
     _validate_command_job,
     _emit_validation_warnings,
     _content_hash,
+    _iter_pipeline_command_components,
     _get_sorted_streamable_logs,
     _incremental_print,
     _wait_before_polling,
@@ -255,11 +256,8 @@ class JobsOperations(_GeneratedJobsOps):
         """
         try:
             resolved_code: Dict[str, str] = {}
-            for node_name, node in (job.jobs or {}).items():
-                if not isinstance(node, dict) or node.get("type") != "command":
-                    continue
-                component = node.get("component")
-                if not isinstance(component, dict) or not isinstance(component.get("code"), str):
+            for node_name, component in _iter_pipeline_command_components(job.jobs or {}):
+                if not isinstance(component.get("code"), str):
                     continue
                 code = component["code"]
                 if code not in resolved_code:

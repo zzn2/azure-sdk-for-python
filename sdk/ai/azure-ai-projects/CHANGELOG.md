@@ -28,6 +28,7 @@
 * When constructing `PipelineJob`, `jobs` accepts `CommandJob` instances with value-bound literal, `uri_file`, and `uri_folder` inputs, code, and outputs and converts them to inline command nodes. Raw graph dictionaries remain supported for other node features.
 * Added `azure.ai.projects.dsl` function-body `@component` and `@pipeline` authoring for native two-step PipelineJobs. Calling the pipeline function builds its graph, packages each Python component body as its own executable Code folder, binds typed inputs and file outputs, and supports repeated component calls. `.pipeline_jobs.create_or_update(pipeline_job)` generates a unique name (sync and async), while the explicit-name form remains available.
 * Added opt-in `@component(code=...)` source-backed components for local helper functions, sibling modules, and resources. Code roots are snapshot with ignore rules before upload and shared by nodes in the same pipeline. Executing these components requires the image to contain a compatible `azure-ai-projects` package and other imported dependencies; bare `@component` keeps its existing standalone execution behavior.
+* Added nested `@pipeline` composition with parent-owned input/output bindings and preserved Pipeline component hierarchy. Nested command source folders are resolved on both job submission surfaces, shared code roots are uploaded once across the graph, and the root job owns staged-folder cleanup. Submission requires service support for inline Pipeline component registration.
 * New optional `priority` property on class `CommandJob`, typed as the new `JobPriority` enum (`LOW`, `MID`, `HIGH`). If omitted, the service defaults to `LOW`.
 * New optional `experiment_name` property on class `CommandJob`, used to group related runs. If omitted, the service uses `Default`.
 * `.beta.jobs.create_or_update` now emits a `UserWarning` when a newly created job sets `resources.instance_type`, `resources.shm_size`, `resources.docker_args` or `resources.properties`. The service infers these from the target compute and ignores them, so they were previously dropped silently. The call still succeeds, and jobs retrieved with `.beta.jobs.get` are not affected.
@@ -92,6 +93,7 @@ Breaking changes in beta classes:
 * Updated job samples `sample_jobs.py` and `sample_jobs_async.py` to show requesting GPUs with `gpu_count` on a GPU cluster versus whole nodes with `instance_count` on a CPU cluster, and to set the new `priority` property.
 * Added `sample_pipeline_two_code.py` to demonstrate a producer and consumer using separate local code folders and a mounted file output.
 * Added `sample_pipeline_dsl.py` to show Python function components and direct pipeline-function job construction.
+* Added `sample_pipeline_nested.py` to show a two-command subgraph called from a parent pipeline and connected to an outer command through its exported output.
 
 ## 2.1.0 (2026-04-20)
 

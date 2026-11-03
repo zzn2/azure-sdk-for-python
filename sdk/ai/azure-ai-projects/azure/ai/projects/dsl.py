@@ -184,6 +184,7 @@ class _PipelineContext:
         outputs: List[_Port],
         arguments: Dict[str, Any],
         source: Optional[_ComponentSource],
+        jobs: Optional[Dict[str, Any]] = None,
     ) -> SimpleNamespace:
         name = func.__name__
         suffix = 2
@@ -211,49 +212,70 @@ class _PipelineContext:
             input_type = port.type if port.type in _DATA_PORT_TYPES else AssetTypes.LITERAL
             bound_inputs[port.name] = Input(type=input_type, value=serialized)
 
-        arguments_in_command = " ".join(
-            [f'"${{{{inputs.{port.name}}}}}"' for port in inputs]
-            + [f'"${{{{outputs.{port.name}}}}}"' for port in outputs]
-        )
-        if source is None:
-            code_dir = TemporaryDirectory(prefix="foundry-component-")
-            self.code_dirs.append(code_dir)
-            (Path(code_dir.name) / "component.py").write_text(_function_script(func, inputs, outputs), encoding="utf-8")
-            command = "python component.py " + arguments_in_command
+        if jobs is not None:
+            node: Dict[str, Any] = {
+                "type": "pipeline",
+                "component": {
+                    "name": name,
+                    "version": "1",
+                    "type": "pipeline",
+                    "inputs": {port.name: {"type": port.type} for port in inputs},
+                    "outputs": {port.name: {"type": port.type} for port in outputs},
+                    "jobs": jobs,
+                },
+                "inputs": {
+                    port_name: {"job_input_type": "literal", "value": value.value}
+                    for port_name, value in bound_inputs.items()
+                },
+                "outputs": {
+                    port.name: {"job_output_type": port.type, "mode": port.mode}
+                    for port in outputs
+                },
+            }
         else:
-            shared_code_dir = self.code_dirs_by_root.get(source.root)
-            if shared_code_dir is None:
-                # pylint: disable-next=consider-using-with
-                code_dir = TemporaryDirectory(prefix="foundry-component-source-")
+            arguments_in_command = " ".join(
+                [f'"${{{{inputs.{port.name}}}}}"' for port in inputs]
+                + [f'"${{{{outputs.{port.name}}}}}"' for port in outputs]
+            )
+            if source is None:
+                code_dir = TemporaryDirectory(prefix="foundry-component-")
                 self.code_dirs.append(code_dir)
-                self.code_dirs_by_root[source.root] = code_dir
-                _stage_component_source(source.root, Path(code_dir.name))
+                (Path(code_dir.name) / "component.py").write_text(_function_script(func, inputs, outputs), encoding="utf-8")
+                command = "python component.py " + arguments_in_command
             else:
-                code_dir = shared_code_dir
-            if not (Path(code_dir.name) / source.relative_file).is_file():
-                raise ValueError(f"Component '{func.__name__}' source file is excluded by its code ignore rules.")
-            port_spec = ",".join(f"{port.name}:{port.conversion}" for port in inputs + outputs) or "-"
-            command = f"python {_RUNNER_NAME} {source.module} {func.__name__} {port_spec}"
-            if arguments_in_command:
-                command += " " + arguments_in_command
+                shared_code_dir = self.code_dirs_by_root.get(source.root)
+                if shared_code_dir is None:
+                    # pylint: disable-next=consider-using-with
+                    code_dir = TemporaryDirectory(prefix="foundry-component-source-")
+                    self.code_dirs.append(code_dir)
+                    self.code_dirs_by_root[source.root] = code_dir
+                    _stage_component_source(source.root, Path(code_dir.name))
+                else:
+                    code_dir = shared_code_dir
+                if not (Path(code_dir.name) / source.relative_file).is_file():
+                    raise ValueError(f"Component '{func.__name__}' source file is excluded by its code ignore rules.")
+                port_spec = ",".join(f"{port.name}:{port.conversion}" for port in inputs + outputs) or "-"
+                command = f"python {_RUNNER_NAME} {source.module} {func.__name__} {port_spec}"
+                if arguments_in_command:
+                    command += " " + arguments_in_command
 
-        job = CommandJob(
-            command=command,
-            code=code_dir.name,
-            environment_image_reference=self.image,
-            compute=self.compute_id,
-            user_assigned_identity_id=self.identity,
-            resources=JobResourceConfiguration(
-                {
-                    "instanceCount": 1,
-                    "instanceType": self.instance_type,
-                    "properties": {"AISuperComputer": {"SLATier": "Premium"}},
-                }
-            ),
-            inputs=bound_inputs,
-            outputs={port.name: _JobOutput(type=port.type, asset_name=port.name, mode=port.mode) for port in outputs},
-        )
-        node = PipelineJob._command_node(name, job, self.compute_id)  # pylint: disable=protected-access
+            job = CommandJob(
+                command=command,
+                code=code_dir.name,
+                environment_image_reference=self.image,
+                compute=self.compute_id,
+                user_assigned_identity_id=self.identity,
+                resources=JobResourceConfiguration(
+                    {
+                        "instanceCount": 1,
+                        "instanceType": self.instance_type,
+                        "properties": {"AISuperComputer": {"SLATier": "Premium"}},
+                    }
+                ),
+                inputs=bound_inputs,
+                outputs={port.name: _JobOutput(type=port.type, asset_name=port.name, mode=port.mode) for port in outputs},
+            )
+            node = PipelineJob._command_node(name, job, self.compute_id)  # pylint: disable=protected-access
         for port in inputs:
             if port.type not in _DATA_PORT_TYPES:
                 node["component"]["inputs"][port.name]["type"] = port.type
@@ -334,10 +356,12 @@ def pipeline(
     environment_image_reference: str,
     user_assigned_identity_id: str,
     instance_type: str,
-) -> Callable[[Callable[..., Any]], Callable[..., PipelineJob]]:
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Decorate a pipeline builder; calling it returns a native Foundry PipelineJob.
 
     Compute, image, identity, and instance type are inherited by each command node.
+    Calling it inside another pipeline adds a nested Pipeline component and returns
+    parent-owned output references instead of a standalone job.
 
     :keyword compute_id: Compute resource ID inherited by the pipeline nodes.
     :paramtype compute_id: str
@@ -351,49 +375,62 @@ def pipeline(
     :rtype: callable
     """
 
-    def decorate(func: Callable[..., Any]) -> Callable[..., PipelineJob]:
+    def decorate(func: Callable[..., Any]) -> Callable[..., Any]:
         signature = inspect.signature(func)
         annotations = get_type_hints(func)
 
         @wraps(func)
-        def build(*args: Any, **kwargs: Any) -> PipelineJob:
+        def build(*args: Any, **kwargs: Any) -> Union[PipelineJob, SimpleNamespace]:
             bound = signature.bind(*args, **kwargs)
             bound.apply_defaults()
+            parent = _ACTIVE_PIPELINE.get()
             context = _PipelineContext(
                 compute_id, environment_image_reference, user_assigned_identity_id, instance_type
             )
+            if parent is not None:
+                context.code_dirs_by_root.update(parent.code_dirs_by_root)
             job_inputs: Dict[str, Input] = {}
+            input_ports: List[_Port] = []
             references: Dict[str, _InputRef] = {}
             for name, value in bound.arguments.items():
                 annotation = annotations.get(name, signature.parameters[name].annotation)
                 if isinstance(annotation, Input):
                     if (
                         annotation.type != AssetTypes.URI_FILE
-                        or not isinstance(value, Input)
-                        or value.type != AssetTypes.URI_FILE
+                        or (
+                            parent is None
+                            and (not isinstance(value, Input) or value.type != AssetTypes.URI_FILE)
+                        )
                     ):
                         raise TypeError(f"Pipeline input '{name}' requires Input(type='uri_file', path=...).")
-                    if not value.path or "://" not in value.path:
-                        raise ValueError(
-                            f"Pipeline input '{name}' requires a remote URI; local files are not supported."
-                        )
-                    job_inputs[name] = value
+                    if parent is None:
+                        if not value.path or "://" not in value.path:
+                            raise ValueError(
+                                f"Pipeline input '{name}' requires a remote URI; local files are not supported."
+                            )
+                        job_inputs[name] = value
                     port_type: str = AssetTypes.URI_FILE
-                elif annotation in _PRIMITIVES and type(value) is annotation:  # pylint: disable=unidiomatic-typecheck
-                    job_inputs[name] = Input(type=AssetTypes.LITERAL, value=str(value))
-                    port_type = _PRIMITIVES[annotation][0]
+                    conversion = "str"
+                elif annotation in _PRIMITIVES and (
+                    parent is not None or type(value) is annotation
+                ):  # pylint: disable=unidiomatic-typecheck
+                    if parent is None:
+                        job_inputs[name] = Input(type=AssetTypes.LITERAL, value=str(value))
+                    port_type, conversion = _PRIMITIVES[annotation]
                 else:
                     raise TypeError(f"Pipeline input '{name}' needs a matching primitive or uri_file Input value.")
+                input_ports.append(_Port(name, port_type, conversion))
                 references[name] = _InputRef(context, name, port_type)
 
             token = _ACTIVE_PIPELINE.set(context)
-            job: Optional[PipelineJob] = None
+            job: Optional[Union[PipelineJob, SimpleNamespace]] = None
             try:
                 try:
                     result = func(**references)
                 finally:
                     _ACTIVE_PIPELINE.reset(token)
                 job_outputs: Dict[str, Dict[str, Any]] = {}
+                output_ports: List[_Port] = []
                 if result is not None:
                     if not isinstance(result, dict):
                         raise TypeError("Pipeline outputs must be returned as a dictionary of node outputs.")
@@ -401,22 +438,36 @@ def pipeline(
                         if not isinstance(value, _OutputRef) or value.owner is not context:
                             raise TypeError(f"Pipeline output '{name}' must reference an output from this pipeline.")
                         node_output = context.jobs[value.node]["outputs"][value.name]
-                        if "path" in node_output:
+                        if "path" in node_output or "value" in node_output:
                             raise ValueError(
                                 f"Node output '{value.node}.{value.name}' cannot bind to multiple pipeline outputs."
                             )
-                        node_output["path"] = f"${{{{parent.outputs.{name}}}}}"
+                        binding = f"${{{{parent.outputs.{name}}}}}"
+                        if parent is None:
+                            node_output["path"] = binding
+                        else:
+                            context.jobs[value.node]["outputs"][value.name] = {
+                                "job_output_type": AssetTypes.LITERAL,
+                                "value": binding,
+                            }
                         job_outputs[name] = {"jobOutputType": value.type, "mode": value.mode}
+                        output_ports.append(_Port(name, value.type, "str", value.mode))
 
-                job = PipelineJob(
-                    display_name=func.__name__,
-                    compute_id=compute_id,
-                    settings={"default_compute": compute_id, "force_rerun": True},
-                    inputs=job_inputs,
-                    outputs=job_outputs,
-                    jobs=context.jobs,
-                )
-                job._component_code_dirs = context.code_dirs  # pylint: disable=protected-access
+                if parent is None:
+                    job = PipelineJob(
+                        display_name=func.__name__,
+                        compute_id=compute_id,
+                        settings={"default_compute": compute_id, "force_rerun": True},
+                        inputs=job_inputs,
+                        outputs=job_outputs,
+                        jobs=context.jobs,
+                    )
+                    job._component_code_dirs = context.code_dirs  # pylint: disable=protected-access
+                else:
+                    node = parent.add(func, input_ports, output_ports, dict(bound.arguments), None, jobs=context.jobs)
+                    parent.code_dirs.extend(context.code_dirs)
+                    parent.code_dirs_by_root.update(context.code_dirs_by_root)
+                    job = node
                 return job
             finally:
                 if job is None:

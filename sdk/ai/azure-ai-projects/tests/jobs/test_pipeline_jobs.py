@@ -44,6 +44,12 @@ from azure.ai.projects._component_source import _RUNNER_NAME, _stage_component_s
 
 _ENDPOINT = "https://fake-account.services.ai.azure.com/api/projects/fake-project"
 _COMPUTE = "/subscriptions/test/resourceGroups/test/providers/Microsoft.CognitiveServices/accounts/test/computes/cpu"
+_DSL_RUNTIME = {
+    "compute_id": _COMPUTE,
+    "environment_image_reference": "example.azurecr.io/train:latest",
+    "user_assigned_identity_id": "/subscriptions/test/identities/hello",
+    "instance_type": "Singularity.D4_v3",
+}
 _TWO_CODE_BUILDER = runpy.run_path(
     str(Path(__file__).resolve().parents[2] / "samples" / "jobs" / "sample_pipeline_two_code.py")
 )["build_job"]
@@ -726,29 +732,336 @@ async def test_pipeline_jobs_async_create_get_and_list() -> None:
     _assert_pipeline_jobs_requests(transport.requests, expected)
 
 
-def _dsl_job(monkeypatch: pytest.MonkeyPatch) -> PipelineJob:
+def _dsl_job(monkeypatch: pytest.MonkeyPatch, sample_name: str = "sample_pipeline_dsl.py") -> PipelineJob:
     monkeypatch.setenv("JOB_COMPUTE_ID", _COMPUTE)
     monkeypatch.setenv("JOB_ENVIRONMENT_IMAGE", "example.azurecr.io/train:latest")
     monkeypatch.setenv("JOB_NODE_UAI_RESOURCE_ID", "/subscriptions/test/identities/hello")
     monkeypatch.setenv("JOB_INSTANCE_TYPE", "Singularity.D4_v3")
-    sample = runpy.run_path(str(Path(__file__).resolve().parents[2] / "samples" / "jobs" / "sample_pipeline_dsl.py"))
+    sample = runpy.run_path(str(Path(__file__).resolve().parents[2] / "samples" / "jobs" / sample_name))
     return sample["workflow"](text="hello")
 
 
-def _source_dsl_job(monkeypatch: pytest.MonkeyPatch) -> PipelineJob:
+def _source_dsl_job(monkeypatch: pytest.MonkeyPatch, *, nested: bool = False) -> PipelineJob:
     monkeypatch.setenv("JOB_COMPUTE_ID", _COMPUTE)
     monkeypatch.setenv("JOB_ENVIRONMENT_IMAGE", "example.azurecr.io/train:latest")
     monkeypatch.setenv("JOB_NODE_UAI_RESOURCE_ID", "/subscriptions/test/identities/hello")
     monkeypatch.setenv("JOB_INSTANCE_TYPE", "Singularity.D4_v3")
     sample = Path(__file__).resolve().parents[2] / "samples" / "jobs" / "pipeline_source"
     monkeypatch.syspath_prepend(str(sample))
-    workflow = runpy.run_path(str(sample / "sample_pipeline_source.py"))["workflow"]
-    return workflow(text=" world ")
+    source = runpy.run_path(str(sample / "sample_pipeline_source.py"))
+    if not nested:
+        return source["workflow"](text=" world ")
+
+    @dsl.pipeline(**_DSL_RUNTIME)
+    def text_subgraph(text: str):
+        stage = source["workflow"](text=text)
+        return {"message": stage.outputs.receipt}
+
+    @dsl.pipeline(**_DSL_RUNTIME)
+    def parent_workflow(text: str):
+        stage = text_subgraph(text=text)
+        final = source["consume"](message=stage.outputs.message)
+        return {"receipt": final.outputs.receipt}
+
+    return parent_workflow(text=" world ")
+
+
+def _dsl_components(jobs: dict[str, Any], prefix: str = "") -> dict[str, dict[str, Any]]:
+    components: dict[str, dict[str, Any]] = {}
+    for name, node in jobs.items():
+        component = node["component"]
+        if not isinstance(component, dict):
+            continue
+        qualified_name = f"{prefix}{name}"
+        if node["type"] == "pipeline":
+            components.update(_dsl_components(component["jobs"], qualified_name + "-"))
+        elif node["type"] == "command":
+            components[qualified_name] = component
+    return components
 
 
 def _dsl_code_paths(job: PipelineJob) -> dict[str, Path]:
     assert job.jobs is not None
-    return {name: Path(node["component"]["code"]) for name, node in job.jobs.items()}
+    return {name: Path(component["code"]) for name, component in _dsl_components(job.jobs).items()}
+
+
+def test_dsl_nested_pipeline_preserves_graph_and_boundary_bindings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job = _dsl_job(monkeypatch, "sample_pipeline_nested.py")
+    paths = _dsl_code_paths(job)
+    try:
+        assert isinstance(job, PipelineJob)
+        assert list(job.jobs) == ["text_subgraph", "consume"]
+        stage = job.jobs["text_subgraph"]
+        assert stage["type"] == "pipeline"
+        assert stage["component"]["name"] == "text_subgraph"
+        assert stage["component"]["version"] == "1"
+        assert stage["component"]["type"] == "pipeline"
+        assert stage["component"]["inputs"] == {"text": {"type": "string"}}
+        assert stage["component"]["outputs"] == {"message": {"type": "uri_file"}}
+        assert stage["inputs"] == {"text": {"job_input_type": "literal", "value": "${{parent.inputs.text}}"}}
+        assert stage["outputs"] == {"message": {"job_output_type": "uri_file", "mode": "ReadWriteMount"}}
+        children = stage["component"]["jobs"]
+        assert list(children) == ["produce", "normalize"]
+        assert children["produce"]["inputs"]["text"]["value"] == "${{parent.inputs.text}}"
+        assert children["normalize"]["inputs"]["message"]["value"] == "${{parent.jobs.produce.outputs.message}}"
+        assert children["normalize"]["outputs"]["normalized"] == {
+            "job_output_type": "literal",
+            "value": "${{parent.outputs.message}}",
+        }
+        assert job.jobs["consume"]["inputs"]["message"]["value"] == (
+            "${{parent.jobs.text_subgraph.outputs.message}}"
+        )
+        assert job.jobs["consume"]["outputs"]["receipt"] == {
+            "job_output_type": "uri_file",
+            "mode": "ReadWriteMount",
+            "path": "${{parent.outputs.receipt}}",
+        }
+        assert job.outputs == {"receipt": {"jobOutputType": "uri_file", "mode": "ReadWriteMount"}}
+        assert set(paths) == {"text_subgraph-produce", "text_subgraph-normalize", "consume"}
+        assert len(job._component_code_dirs) == 3
+
+        message, normalized, receipt = (tmp_path / name for name in ("message.txt", "normalized.txt", "receipt.txt"))
+        for node, arguments in (
+            ("text_subgraph-produce", [" hello ", str(message)]),
+            ("text_subgraph-normalize", [str(message), str(normalized)]),
+            ("consume", [str(normalized), str(receipt)]),
+        ):
+            subprocess.run(
+                [sys.executable, str(paths[node] / "component.py"), *arguments],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        assert receipt.read_text(encoding="utf-8") == "HELLO"
+    finally:
+        for directory in job._component_code_dirs:
+            directory.cleanup()
+
+    sample = runpy.run_path(
+        str(Path(__file__).resolve().parents[2] / "samples" / "jobs" / "sample_pipeline_nested.py")
+    )
+    standalone = sample["text_subgraph"](text="hello")
+    try:
+        assert isinstance(standalone, PipelineJob)
+        assert list(standalone.jobs) == ["produce", "normalize"]
+        assert standalone.jobs["normalize"]["outputs"]["normalized"] == {
+            "job_output_type": "uri_file",
+            "mode": "ReadWriteMount",
+            "path": "${{parent.outputs.message}}",
+        }
+    finally:
+        for directory in standalone._component_code_dirs:
+            directory.cleanup()
+
+
+def test_dsl_nested_pipeline_accepts_parent_node_outputs_and_repeated_calls() -> None:
+    @dsl.component
+    def produce(text: str, message: dsl.Output(type="uri_file")) -> None:
+        Path(message).write_text(text, encoding="utf-8")
+
+    @dsl.component
+    def relay(message: dsl.Input(type="uri_file"), result: dsl.Output(type="uri_file")) -> None:
+        Path(result).write_text(Path(message).read_text(encoding="utf-8"), encoding="utf-8")
+
+    @dsl.pipeline(**_DSL_RUNTIME)
+    def subgraph(source: dsl.Input(type="uri_file")):
+        return {"file": relay(message=source).outputs.result}
+
+    @dsl.pipeline(**_DSL_RUNTIME)
+    def workflow(text: str):
+        first = produce(text=text)
+        stage = subgraph(source=first.outputs.message)
+        repeated = subgraph(source=stage.outputs.file)
+        return {"receipt": repeated.outputs.file}
+
+    job = workflow(text="hello")
+    try:
+        assert list(job.jobs) == ["produce", "subgraph", "subgraph_2"]
+        first, second = job.jobs["subgraph"], job.jobs["subgraph_2"]
+        assert first["inputs"]["source"]["value"] == "${{parent.jobs.produce.outputs.message}}"
+        assert second["inputs"]["source"]["value"] == "${{parent.jobs.subgraph.outputs.file}}"
+        assert first["component"]["inputs"] == {"source": {"type": "uri_file"}}
+        assert first["component"]["jobs"]["relay"]["inputs"]["message"]["value"] == "${{parent.inputs.source}}"
+        assert first["component"]["jobs"]["relay"]["outputs"]["result"] == {
+            "job_output_type": "literal",
+            "value": "${{parent.outputs.file}}",
+        }
+        assert second["outputs"]["file"]["path"] == "${{parent.outputs.receipt}}"
+    finally:
+        for directory in job._component_code_dirs:
+            directory.cleanup()
+
+
+def test_dsl_nested_authoring_failures_preserve_parent_sources_and_cleanup_new_directories(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sample = Path(__file__).resolve().parents[2] / "samples" / "jobs" / "pipeline_source"
+    monkeypatch.syspath_prepend(str(sample))
+    source = importlib.import_module("steps.source_pipeline_components")
+    original_directory = dsl.TemporaryDirectory
+    paths: list[Path] = []
+
+    def temporary_directory(*args: Any, **kwargs: Any) -> Any:
+        directory = original_directory(*args, **kwargs)
+        paths.append(Path(directory.name))
+        return directory
+
+    monkeypatch.setattr(dsl, "TemporaryDirectory", temporary_directory)
+
+    @dsl.component
+    def fresh(text: str, result: dsl.Output(type="uri_file")) -> None:
+        Path(result).write_text(text, encoding="utf-8")
+
+    @dsl.pipeline(**_DSL_RUNTIME)
+    def broken(text: str):
+        source.produce(text=text)
+        fresh(text=text)
+        raise RuntimeError("child authoring failed")
+
+    @dsl.pipeline(**_DSL_RUNTIME)
+    def workflow(text: str):
+        first = source.produce(text=text)
+        with pytest.raises(RuntimeError, match="child authoring failed"):
+            broken(text=text)
+        final = source.consume(message=first.outputs.message)
+        return {"receipt": final.outputs.receipt}
+
+    job = workflow(text="hello")
+    try:
+        assert list(job.jobs) == ["produce", "consume"]
+        assert len(paths) == 2
+        assert paths[0].is_dir()
+        assert not paths[1].exists()
+        assert len(job._component_code_dirs) == 1
+        assert set(_dsl_code_paths(job).values()) == {paths[0]}
+    finally:
+        for directory in job._component_code_dirs:
+            directory.cleanup()
+
+    @dsl.pipeline(**_DSL_RUNTIME)
+    def failing_parent(text: str):
+        workflow(text=text)
+        raise RuntimeError("parent authoring failed")
+
+    with pytest.raises(RuntimeError, match="parent authoring failed"):
+        failing_parent(text="hello")
+    assert len(paths) == 4
+    assert all(not path.exists() for path in paths)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize("surface", ["jobs", "pipeline_jobs"])
+@pytest.mark.parametrize("source_backed", [False, True], ids=["function-body", "source-backed"])
+@pytest.mark.parametrize("outcome", ["uploaded", "cached", "upload_failed", "submit_failed"])
+async def test_dsl_nested_pipeline_resolves_code_and_cleans_all_submission_paths(
+    monkeypatch: pytest.MonkeyPatch, asynchronous: bool, surface: str, source_backed: bool, outcome: str
+) -> None:
+    job = (
+        _source_dsl_job(monkeypatch, nested=True)
+        if source_backed
+        else _dsl_job(monkeypatch, "sample_pipeline_nested.py")
+    )
+    paths = _dsl_code_paths(job)
+    snapshots = set(paths.values())
+    versions = {_content_hash(path) for path in snapshots}
+    lookups: list[tuple[str, str]] = []
+    uploads: list[str] = []
+    registered = {"type": "pipeline", "component": "azureml:registered-pipeline:1"}
+    registered_command = {"type": "command", "component": "azureml:registered-command:1"}
+    job.jobs["registered"] = registered
+    job.jobs["registered_command"] = registered_command
+
+    def get(*, name: str, version: str) -> DatasetVersion:
+        assert all(path.is_dir() for path in snapshots)
+        lookups.append((name, version))
+        if outcome == "cached":
+            return _uploaded_code(name, version)
+        raise ResourceNotFoundError(f"Dataset {name}:{version} not found")
+
+    def upload_folder(*, name: str, version: str, folder: str, **kwargs: Any) -> DatasetVersion:
+        assert all(path.is_dir() for path in snapshots)
+        if source_backed:
+            assert (Path(folder) / "steps" / "helpers.py").is_file()
+        uploads.append(folder)
+        if outcome == "upload_failed" and len(uploads) == len(snapshots):
+            raise RuntimeError("upload_failed")
+        return _uploaded_code(name, version)
+
+    async def get_async(**kwargs: Any) -> DatasetVersion:
+        return get(**kwargs)
+
+    async def upload_folder_async(**kwargs: Any) -> DatasetVersion:
+        return upload_folder(**kwargs)
+
+    if asynchronous:
+        async_transport = _AsyncTransport([_response("Pipeline")])
+        requests = async_transport.requests
+
+        async def send_async(request: HttpRequest, **kwargs: Any) -> AsyncHttpResponse:
+            requests.append(request)
+            raise RuntimeError("submit_failed")
+
+        if outcome == "submit_failed":
+            monkeypatch.setattr(async_transport, "send", send_async)
+        async with AsyncAIProjectClient(
+            endpoint=_ENDPOINT, credential=_AsyncCredential(), transport=async_transport  # type: ignore[arg-type]
+        ) as client:
+            operations = client.beta.jobs if surface == "jobs" else client.pipeline_jobs
+            monkeypatch.setattr(operations._datasets, "get", get_async)
+            monkeypatch.setattr(operations._datasets, "upload_folder", upload_folder_async)
+            if outcome.endswith("_failed"):
+                with pytest.raises(RuntimeError, match=outcome):
+                    await operations.create_or_update(name="nested", job=job)
+            else:
+                assert isinstance(await operations.create_or_update(name="nested", job=job), PipelineJob)
+    else:
+        sync_transport = _Transport([_response("Pipeline")])
+        requests = sync_transport.requests
+
+        def send(request: HttpRequest, **kwargs: Any) -> HttpResponse:
+            requests.append(request)
+            raise RuntimeError("submit_failed")
+
+        if outcome == "submit_failed":
+            monkeypatch.setattr(sync_transport, "send", send)
+        with AIProjectClient(
+            endpoint=_ENDPOINT, credential=_Credential(), transport=sync_transport  # type: ignore[arg-type]
+        ) as sync_client:
+            sync_operations = sync_client.beta.jobs if surface == "jobs" else sync_client.pipeline_jobs
+            monkeypatch.setattr(sync_operations._datasets, "get", get)
+            monkeypatch.setattr(sync_operations._datasets, "upload_folder", upload_folder)
+            if outcome.endswith("_failed"):
+                with pytest.raises(RuntimeError, match=outcome):
+                    sync_operations.create_or_update(name="nested", job=job)
+            else:
+                assert isinstance(sync_operations.create_or_update(name="nested", job=job), PipelineJob)
+
+    assert all(not path.exists() for path in snapshots)
+    assert job._component_code_dirs == []
+    assert len(snapshots) == (1 if source_backed else 3)
+    assert len(lookups) == len(snapshots)
+    assert {version for _, version in lookups} == versions
+    assert len(uploads) == (0 if outcome == "cached" else len(snapshots))
+    if outcome == "upload_failed":
+        assert requests == []
+    else:
+        assert len(requests) == 1
+        request = requests[0]
+        assert request.method == "PUT"
+        assert urlparse(request.url).path.endswith(f"/{surface}/nested")
+        assert request.headers["Foundry-Features"] == "Jobs=V1Preview"
+        assert parse_qs(urlparse(request.url).query)["api-version"] == ["2026-01-15-preview"]
+        properties = json.loads(request.body)["properties"]
+        components = _dsl_components(properties["jobs"])
+        assert len(components) == 3
+        assert {component["code"] for component in components.values()} == {
+            _code_uri(name, version) for name, version in lookups
+        }
+        assert properties["jobs"]["registered"] == registered
+        assert properties["jobs"]["registered_command"] == registered_command
 
 
 def _assert_dsl_request(request: HttpRequest, uploaded: dict[str, str]) -> None:
