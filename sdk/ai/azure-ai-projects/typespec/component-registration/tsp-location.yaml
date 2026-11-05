@@ -1,0 +1,7 @@
+# Local-only generation input, not a declaration in the external Foundry spec.
+directory: sdk/ai/azure-ai-projects/typespec/component-registration/specification/ai-foundry/data-plane/Foundry
+repo: Azure/azure-sdk-for-python
+commit: local
+additionalDirectories: []
+entrypointFile: client.tsp
+emitterPackageJsonPath: sdk/ai/azure-ai-projects/typespec/component-registration/emitter-package.json

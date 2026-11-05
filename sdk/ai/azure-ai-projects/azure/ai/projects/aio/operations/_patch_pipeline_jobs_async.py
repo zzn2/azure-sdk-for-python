@@ -16,6 +16,9 @@ from azure.core.tracing.decorator_async import distributed_trace_async
 
 from .._configuration import AIProjectClientConfiguration
 from ._operations import PipelineJobsOperations as _GeneratedPipelineJobsOperations
+from ._pipeline_component_registration_operations import (
+    PipelineComponentRegistrationOperations as _GeneratedComponentRegistrationOperations,
+)
 from ._patch_datasets_async import DatasetsOperations
 from ._patch_jobs_async import JobsOperations as _BetaJobsOperations
 from ...models._enums import ListViewType, _FoundryFeaturesOptInKeys
@@ -51,6 +54,9 @@ class PipelineJobsOperations(_GeneratedPipelineJobsOperations):
         self._datasets = DatasetsOperations(
             self._client, original_config, self._serialize, self._deserialize
         )
+        self._component_registration = _GeneratedComponentRegistrationOperations(
+            self._client, original_config, self._serialize, self._deserialize
+        )
 
     # Keep route-specific request handling in the generated Pipeline Jobs class,
     # while reusing the proven local-asset contract from beta.jobs.
@@ -64,8 +70,8 @@ class PipelineJobsOperations(_GeneratedPipelineJobsOperations):
             self, uri, dataset_name, base_path
         )
 
-    async def _resolve_pipeline_code(self, name: str, job: PipelineJob) -> None:
-        await _BetaJobsOperations._resolve_pipeline_code(self, name, job)  # type: ignore[arg-type]
+    async def _resolve_pipeline_code(self, name: str, job: PipelineJob) -> PipelineJob:
+        return await _BetaJobsOperations._resolve_pipeline_code(self, name, job)  # type: ignore[arg-type]
 
     def _inject_preview_header(self, kwargs: dict) -> None:
         _BetaJobsOperations._inject_preview_header(self, kwargs)  # type: ignore[arg-type]
@@ -179,7 +185,7 @@ class PipelineJobsOperations(_GeneratedPipelineJobsOperations):
         if not isinstance(job, PipelineJob):
             raise TypeError("job must be a PipelineJob")
 
-        await self._resolve_pipeline_code(name, job)
+        job = await self._resolve_pipeline_code(name, job)
         self._inject_preview_header(kwargs)
         _logger.debug(
             "[PipelineJobsOperations] Submitting PipelineJob '%s' with %d graph node(s) through /pipeline_jobs.",

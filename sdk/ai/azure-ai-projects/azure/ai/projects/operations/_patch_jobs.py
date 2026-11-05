@@ -5,7 +5,7 @@
 # ------------------------------------
 """Customized jobs operations — flat CommandJob and PipelineJob UX, no envelope required."""
 
-from copy import copy
+from copy import copy, deepcopy
 import json
 import logging
 import sys
@@ -30,6 +30,9 @@ from azure.storage.blob import ContainerClient
 
 from ._operations import BetaJobsOperations as _GeneratedJobsOps
 from ._operations import BetaModelsOperations as _GeneratedModelsOps
+from ._pipeline_component_registration_operations import (
+    PipelineComponentRegistrationOperations as _GeneratedComponentRegistrationOperations,
+)
 from ._patch_datasets import DatasetsOperations
 from ._job_helper import (
     _TERMINAL_JOB_STATUSES,
@@ -98,6 +101,9 @@ class JobsOperations(_GeneratedJobsOps):
         self._config.api_version = "2026-01-15-preview"
         self._datasets = DatasetsOperations(self._client, original_config, self._serialize, self._deserialize)
         self._models = _GeneratedModelsOps(self._client, original_config, self._serialize, self._deserialize)
+        self._component_registration = _GeneratedComponentRegistrationOperations(
+            self._client, original_config, self._serialize, self._deserialize
+        )
 
     @distributed_trace
     def validate(
@@ -245,18 +251,20 @@ class JobsOperations(_GeneratedJobsOps):
         self._resolve_code(name, job)
         self._resolve_input_paths(name, job)
 
-    def _resolve_pipeline_code(self, name: str, job: PipelineJob) -> None:
-        """Resolve local code folders on inline command nodes to dataset asset URIs.
+    def _resolve_pipeline_code(self, name: str, job: PipelineJob) -> PipelineJob:
+        """Resolve code and register inline Commands on a submission copy.
 
         :param name: Name of the pipeline job.
         :type name: str
         :param job: Pipeline job containing inline command nodes.
         :type job: ~azure.ai.projects.models.PipelineJob
+        :return: A submission copy referencing registered Command component IDs.
+        :rtype: ~azure.ai.projects.models.PipelineJob
         """
         try:
             resolved_code: Dict[str, str] = {}
             for node_name, node in (job.jobs or {}).items():
-                if not isinstance(node, dict) or node.get("type") != "command":
+                if not isinstance(node, dict) or node.get("type") != "command" or "componentId" in node:
                     continue
                 component = node.get("component")
                 if not isinstance(component, dict) or not isinstance(component.get("code"), str):
@@ -279,6 +287,25 @@ class JobsOperations(_GeneratedJobsOps):
             for directory in job._component_code_dirs:
                 directory.cleanup()
             job._component_code_dirs.clear()
+
+        submission = PipelineJob(deepcopy(job.as_dict(exclude_readonly=True)))
+        for node in (submission.jobs or {}).values():
+            if not isinstance(node, dict) or node.get("type") != "command" or "componentId" in node:
+                continue
+            component = node.get("component")
+            if not isinstance(component, dict):
+                continue
+            registered = self._component_registration._register_command_component(
+                name=component["name"],
+                version=str(component["version"]),
+                component={"properties": {"componentSpec": component}},
+            )
+            component_id = registered.get("id")
+            if not isinstance(component_id, str) or not component_id:
+                raise ValueError(f"Component '{component['name']}' registration did not return an executable ID.")
+            node["componentId"] = component_id
+            del node["component"]
+        return submission
 
     def _inject_preview_header(self, kwargs: dict) -> None:
         """Add the Jobs preview feature header if not already present.
@@ -433,7 +460,7 @@ class JobsOperations(_GeneratedJobsOps):
                 _emit_validation_warnings(_validate_command_job(job).try_raise(raise_on_failure=True))
             self._resolve_local_paths(name, job)
         elif isinstance(job, PipelineJob):
-            self._resolve_pipeline_code(name, job)
+            job = self._resolve_pipeline_code(name, job)
         else:
             raise TypeError("job must be a CommandJob or PipelineJob")
         self._inject_preview_header(kwargs)

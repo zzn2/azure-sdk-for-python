@@ -1,0 +1,15 @@
+emit:
+  - "@azure-tools/typespec-python"
+options:
+  "@azure-tools/typespec-python":
+    emitter-output-dir: "{output-dir}/sdk/ai/azure-ai-projects/typespec/component-registration/output"
+    namespace: azure.ai.projects
+    package-name: azure-ai-projects
+    flavor: azure
+    models-mode: none
+    generate-typeddict: false
+    generate-packaging-files: false
+    generate-sample: false
+    generate-test: false
+    emit-cross-language-definition-file: false
+    combine-operation-files: false
