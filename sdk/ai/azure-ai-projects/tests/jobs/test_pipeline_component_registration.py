@@ -11,8 +11,15 @@ from typing import Any, Iterator
 from urllib.parse import parse_qs, quote, urlparse
 
 import pytest
+import requests
 from azure.core.exceptions import HttpResponseError, ResourceNotFoundError
-from azure.core.pipeline.transport import AsyncHttpResponse, HttpRequest, HttpResponse
+from azure.core.pipeline.transport import (
+    AsyncHttpResponse,
+    AsyncioRequestsTransport,
+    HttpRequest,
+    HttpResponse,
+    RequestsTransport,
+)
 
 from azure.ai.projects import AIProjectClient
 from azure.ai.projects.aio import AIProjectClient as AsyncAIProjectClient
@@ -180,6 +187,51 @@ def _assert_registered_submission(scenario: _RegistrationScenario, job: Pipeline
     assert scenario.submissions[-1] == scenario.registered_payload()
     # Existing code-URI resolution may update code; registration must retain the authored component.
     assert job.as_dict(exclude_readonly=True) == scenario.uploaded_authoring()
+
+
+def _mock_requests_session(scenario: _RegistrationScenario, monkeypatch: pytest.MonkeyPatch) -> requests.Session:
+    session = requests.Session()
+
+    def respond(method: str, url: str, **kwargs: Any) -> requests.Response:
+        request = HttpRequest(method, url, headers=kwargs.get("headers"), data=kwargs.get("data"))
+        payload, status = scenario.respond(request)
+        response = requests.Response()
+        response.status_code = status
+        response.headers["Content-Type"] = "application/json"
+        response.url = url
+        response._content = json.dumps(payload).encode()
+        response._content_consumed = True
+        return response
+
+    monkeypatch.setattr(session, "request", respond)
+    return session
+
+
+def test_registration_with_standard_core_rest_responses(
+    authored_job: PipelineJob, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scenario = _RegistrationScenario(authored_job, "pipeline_jobs")
+    with _mock_requests_session(scenario, monkeypatch) as session:
+        transport = RequestsTransport(session=session, session_owner=False)
+        with AIProjectClient(endpoint=_ENDPOINT, credential=_Credential(), transport=transport) as client:  # type: ignore[arg-type]
+            _mock_source_upload(client.pipeline_jobs, scenario, monkeypatch)
+            client.pipeline_jobs.create_or_update(_JOB_NAME, authored_job)
+    _assert_registered_submission(scenario, authored_job)
+
+
+@pytest.mark.asyncio
+async def test_registration_with_standard_core_rest_responses_async(
+    authored_job: PipelineJob, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scenario = _RegistrationScenario(authored_job, "pipeline_jobs")
+    with _mock_requests_session(scenario, monkeypatch) as session:
+        transport = AsyncioRequestsTransport(session=session, session_owner=False)
+        async with AsyncAIProjectClient(
+            endpoint=_ENDPOINT, credential=_AsyncCredential(), transport=transport  # type: ignore[arg-type]
+        ) as client:
+            _mock_source_upload(client.pipeline_jobs, scenario, monkeypatch, is_async=True)
+            await client.pipeline_jobs.create_or_update(_JOB_NAME, authored_job)
+    _assert_registered_submission(scenario, authored_job)
 
 
 @pytest.mark.parametrize("surface", _SURFACES)
