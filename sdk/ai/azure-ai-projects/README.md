@@ -187,6 +187,13 @@ builder. Submit it with `client.pipeline_jobs.create_or_update(job)` for an auto
 optionally passing `experiment_name="pipeline_samples"`, or use the existing
 `create_or_update(name=..., job=...)` form.
 
+Submission uploads local Code first, then registers each top-level inline Command component
+using its existing name and version. The submitted graph contains the service's opaque
+`componentId`; the authored component remains reusable. Registration errors prevent job
+submission, with no inline fallback or default GET. Existing registered references are
+preserved. This requires the project's Component PUT route for `2026-01-15-preview`
+to be deployed and authorized; nested Pipeline component registration is not supported.
+
 See the [two-component Python sample](https://github.com/Azure/azure-sdk-for-python/blob/main/sdk/ai/azure-ai-projects/samples/jobs/sample_pipeline_dsl.py) for a producer and
 consumer connected through a mounted file. Each function body is packaged into a separate Code
 folder and runs on the selected compute, not when the graph is built. Component functions must be

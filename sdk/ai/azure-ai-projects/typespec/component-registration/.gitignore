@@ -1,0 +1,4 @@
+node_modules/
+TempTypeSpecFiles/
+output/
+tsp-client-metadata.yaml

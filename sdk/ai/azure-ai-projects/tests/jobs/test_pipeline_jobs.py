@@ -5,6 +5,7 @@
 """Offline wire and response tests for Command and Pipeline jobs."""
 
 import importlib
+from copy import deepcopy
 import json
 import os
 import re
@@ -13,7 +14,7 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Union
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 import pytest
 from azure.core.credentials import AccessToken
@@ -120,6 +121,10 @@ class _JsonResponse(HttpResponse):
     def body(self) -> bytes:
         return self._content
 
+    @property
+    def content(self) -> bytes:
+        return self._content
+
     def json(self) -> Any:
         return json.loads(self._content)
 
@@ -132,6 +137,10 @@ class _AsyncJsonResponse(AsyncHttpResponse):
         self._content = json.dumps(payload).encode()
 
     def body(self) -> bytes:
+        return self._content
+
+    @property
+    def content(self) -> bytes:
         return self._content
 
     async def read(self) -> bytes:
@@ -148,6 +157,9 @@ class _Transport(HttpTransport):
 
     def send(self, request: HttpRequest, **kwargs: Any) -> HttpResponse:
         self.requests.append(request)
+        if "/components/" in urlparse(request.url).path:
+            spec = json.loads(request.body)["properties"]["componentSpec"]
+            return _JsonResponse(request, {"id": _registered_component_id(spec["name"], spec["version"])})
         return _JsonResponse(request, next(self._responses))
 
     def open(self) -> None:
@@ -167,6 +179,9 @@ class _AsyncTransport(AsyncHttpTransport):
 
     async def send(self, request: HttpRequest, **kwargs: Any) -> AsyncHttpResponse:
         self.requests.append(request)
+        if "/components/" in urlparse(request.url).path:
+            spec = json.loads(request.body)["properties"]["componentSpec"]
+            return _AsyncJsonResponse(request, {"id": _registered_component_id(spec["name"], spec["version"])})
         return _AsyncJsonResponse(request, next(self._responses))
 
     async def open(self) -> None:
@@ -273,10 +288,38 @@ def _inline_pipeline() -> tuple[PipelineJob, CommandJob]:
     return pipeline, command
 
 
-def _assert_inline_request(request: HttpRequest) -> None:
+def _registered_component_id(name: str, version: str) -> str:
+    return (
+        "/subscriptions/test/resourceGroups/test/providers/Microsoft.MachineLearningServices/"
+        f"workspaces/fake-account@fake-project@AML/components/{name}/versions/{version}"
+    )
+
+
+def _assert_registered_pipeline_requests(requests: list[HttpRequest], properties: dict[str, Any]) -> None:
+    expected = deepcopy(properties)
+    nodes = [
+        node for node in expected["jobs"].values()
+        if node.get("type") == "command" and isinstance(node.get("component"), dict)
+    ]
+    assert len(requests) == len(nodes) + 1
+    for request, node in zip(requests[:-1], nodes):
+        spec = node.pop("component")
+        assert request.method == "PUT"
+        assert urlparse(request.url).path == (
+            f"{urlparse(_ENDPOINT).path}/components/{quote(spec['name'], safe='')}"
+            f"/versions/{quote(str(spec['version']), safe='')}"
+        )
+        assert parse_qs(urlparse(request.url).query)["api-version"] == ["2026-01-15-preview"]
+        assert json.loads(request.body) == {"properties": {"componentSpec": spec}}
+        node["componentId"] = _registered_component_id(spec["name"], spec["version"])
+    assert json.loads(requests[-1].body) == {"properties": expected}
+
+
+def _assert_inline_request(requests: list[HttpRequest]) -> None:
+    request = requests[-1]
     assert request.method == "PUT"
     assert request.headers["Foundry-Features"] == "Jobs=V1Preview"
-    assert json.loads(request.body) == {"properties": _INLINE_PIPELINE_PROPERTIES}
+    _assert_registered_pipeline_requests(requests, _INLINE_PIPELINE_PROPERTIES)
 
 
 def _two_code_job(tmp_path: Path) -> tuple[PipelineJob, dict[str, Path]]:
@@ -311,7 +354,8 @@ def _uploaded_code(name: str, version: str) -> DatasetVersion:
     )
 
 
-def _assert_two_code_request(request: HttpRequest, code_uris: dict[str, str]) -> None:
+def _assert_two_code_request(requests: list[HttpRequest], code_uris: dict[str, str]) -> None:
+    request = requests[-1]
     assert request.method == "PUT"
     assert request.headers["Foundry-Features"] == "Jobs=V1Preview"
     assert parse_qs(urlparse(request.url).query)["api-version"] == ["2026-01-15-preview"]
@@ -373,7 +417,7 @@ def _assert_two_code_request(request: HttpRequest, code_uris: dict[str, str]) ->
             },
         }
     }
-    assert json.loads(request.body) == expected
+    _assert_registered_pipeline_requests(requests, expected["properties"])
 
 
 def test_jobs_sync_create_from_command_node() -> None:
@@ -383,8 +427,7 @@ def test_jobs_sync_create_from_command_node() -> None:
     with AIProjectClient(endpoint=_ENDPOINT, credential=_Credential(), transport=transport) as client:  # type: ignore[arg-type]
         _assert_job(client.pipeline_jobs.create_or_update("pipeline", pipeline), "Pipeline")
 
-    assert len(transport.requests) == 1
-    _assert_inline_request(transport.requests[0])
+    _assert_inline_request(transport.requests)
     assert command.inputs is not None
     assert command.inputs["name"].value == "${{parent.inputs.name}}"
     assert command.resources is not None
@@ -401,8 +444,7 @@ async def test_jobs_async_create_from_command_node() -> None:
     ) as client:
         _assert_job(await client.pipeline_jobs.create_or_update("pipeline", pipeline), "Pipeline")
 
-    assert len(transport.requests) == 1
-    _assert_inline_request(transport.requests[0])
+    _assert_inline_request(transport.requests)
 
 
 def test_jobs_sync_create_from_mapping_with_command_node() -> None:
@@ -421,8 +463,7 @@ def test_jobs_sync_create_from_mapping_with_command_node() -> None:
     with AIProjectClient(endpoint=_ENDPOINT, credential=_Credential(), transport=transport) as client:  # type: ignore[arg-type]
         _assert_job(client.pipeline_jobs.create_or_update("pipeline", pipeline), "Pipeline")
 
-    assert len(transport.requests) == 1
-    _assert_inline_request(transport.requests[0])
+    _assert_inline_request(transport.requests)
 
 
 def test_pipeline_composes_commands_and_preserves_raw_graph_nodes() -> None:
@@ -507,12 +548,11 @@ def test_pipeline_converts_value_bound_uri_folder_input() -> None:
             "Pipeline",
         )
 
-    submitted_jobs = json.loads(transport.requests[0].body)[
+    _assert_registered_pipeline_requests(transport.requests, pipeline.as_dict(exclude_readonly=True))
+    submitted_jobs = json.loads(transport.requests[-1].body)[
         "properties"
     ]["jobs"]
-    assert submitted_jobs["consumer"]["component"]["inputs"][
-        "bundle"
-    ] == {"type": "uri_folder"}
+    assert submitted_jobs["consumer"]["componentId"] == _registered_component_id("consumer", "1")
     assert submitted_jobs["consumer"]["inputs"]["bundle"] == {
         "job_input_type": "literal",
         "value": "${{parent.jobs.producer.outputs.bundle}}",
@@ -547,9 +587,8 @@ def test_pipeline_uploads_both_local_code_folders(tmp_path: Path, monkeypatch: p
         ("two-code-consume-code", str(code_dirs["consume"])),
     ]
     assert uploads[0][1] != uploads[1][1]
-    assert len(transport.requests) == 1
     _assert_two_code_request(
-        transport.requests[0],
+        transport.requests,
         {
             name.removeprefix("two-code-").removesuffix("-code"): _code_uri(name, version)
             for name, version, _ in uploads
@@ -587,9 +626,8 @@ async def test_pipeline_uploads_both_local_code_folders_async(tmp_path: Path, mo
         ("two-code-produce-code", str(code_dirs["produce"])),
         ("two-code-consume-code", str(code_dirs["consume"])),
     ]
-    assert len(transport.requests) == 1
     _assert_two_code_request(
-        transport.requests[0],
+        transport.requests,
         {
             name.removeprefix("two-code-").removesuffix("-code"): _code_uri(name, version)
             for name, version, _ in uploads
@@ -751,7 +789,8 @@ def _dsl_code_paths(job: PipelineJob) -> dict[str, Path]:
     return {name: Path(node["component"]["code"]) for name, node in job.jobs.items()}
 
 
-def _assert_dsl_request(request: HttpRequest, uploaded: dict[str, str]) -> None:
+def _assert_dsl_request(requests: list[HttpRequest], uploaded: dict[str, str]) -> None:
+    request = requests[-1]
     assert request.method == "PUT"
     assert request.headers["Foundry-Features"] == "Jobs=V1Preview"
     assert parse_qs(urlparse(request.url).query)["api-version"] == ["2026-01-15-preview"]
@@ -762,7 +801,7 @@ def _assert_dsl_request(request: HttpRequest, uploaded: dict[str, str]) -> None:
         "properties": {"AISuperComputer": {"SLATier": "Premium"}},
     }
     identity = {"type": "managed", "msi_resource_id": "/subscriptions/test/identities/hello"}
-    assert json.loads(request.body) == {
+    expected = {
         "properties": {
             "jobType": "Pipeline",
             "displayName": "workflow",
@@ -820,6 +859,7 @@ def _assert_dsl_request(request: HttpRequest, uploaded: dict[str, str]) -> None:
             },
         }
     }
+    _assert_registered_pipeline_requests(requests, expected["properties"])
 
 
 def test_dsl_component_bodies_execute_with_module_level_imports(
@@ -880,9 +920,8 @@ def test_dsl_sync_uploads_code_and_cleans_after_submission(monkeypatch: pytest.M
     assert [name.rsplit("-", 2)[-2] for name, _ in uploads] == ["produce", "consume"]
     assert [folder for _, folder in uploads] == [str(paths["produce"]), str(paths["consume"])]
     assert all(not path.exists() for path in paths.values())
-    assert len(transport.requests) == 1
     code_uris = {name.rsplit("-", 2)[-2]: job.jobs[name.rsplit("-", 2)[-2]]["component"]["code"] for name, _ in uploads}
-    _assert_dsl_request(transport.requests[0], code_uris)
+    _assert_dsl_request(transport.requests, code_uris)
 
 
 @pytest.mark.asyncio
@@ -911,8 +950,8 @@ async def test_dsl_async_uploads_code_and_cleans_after_submission(monkeypatch: p
     assert len(uploads) == 2
     assert [folder for _, folder in uploads] == [str(paths["produce"]), str(paths["consume"])]
     assert all(not path.exists() for path in paths.values())
-    assert len(transport.requests) == 1
-    assert json.loads(transport.requests[0].body)["properties"]["experimentName"] == "pipeline_samples"
+    _assert_registered_pipeline_requests(transport.requests, job.as_dict(exclude_readonly=True))
+    assert json.loads(transport.requests[-1].body)["properties"]["experimentName"] == "pipeline_samples"
 
 
 def test_dsl_upload_failure_cleans_code_without_put(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1242,10 +1281,10 @@ def test_dsl_source_sync_uploads_shared_snapshot_once(monkeypatch: pytest.Monkey
     assert len(uploads) == 1
     assert uploads[0][1] == str(snapshot)
     assert not snapshot.exists()
-    assert len(transport.requests) == 1
-    properties = json.loads(transport.requests[0].body)["properties"]
-    assert properties["jobs"]["produce"]["component"]["code"] == properties["jobs"]["consume"]["component"]["code"]
-    assert properties["jobs"]["produce"]["component"]["code"] == job.jobs["produce"]["component"]["code"]
+    _assert_registered_pipeline_requests(transport.requests, job.as_dict(exclude_readonly=True))
+    specs = [json.loads(request.body)["properties"]["componentSpec"] for request in transport.requests[:-1]]
+    assert specs[0]["code"] == specs[1]["code"] == job.jobs["produce"]["component"]["code"]
+    properties = json.loads(transport.requests[-1].body)["properties"]
     assert properties["experimentName"] == "pipeline_samples"
 
 
@@ -1272,9 +1311,9 @@ async def test_dsl_source_async_uploads_shared_snapshot_once(monkeypatch: pytest
 
     assert uploads == [str(snapshot)]
     assert not snapshot.exists()
-    assert len(transport.requests) == 1
-    properties = json.loads(transport.requests[0].body)["properties"]
-    assert properties["jobs"]["produce"]["component"]["code"] == properties["jobs"]["consume"]["component"]["code"]
+    _assert_registered_pipeline_requests(transport.requests, job.as_dict(exclude_readonly=True))
+    specs = [json.loads(request.body)["properties"]["componentSpec"] for request in transport.requests[:-1]]
+    assert specs[0]["code"] == specs[1]["code"]
 
 
 def test_dsl_source_snapshot_filters_files_before_hash_and_upload(tmp_path: Path) -> None:
