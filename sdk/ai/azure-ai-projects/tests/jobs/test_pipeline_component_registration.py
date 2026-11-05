@@ -12,6 +12,7 @@ from urllib.parse import parse_qs, quote, urlparse
 
 import pytest
 import requests
+from urllib3.response import HTTPResponse as Urllib3Response
 from azure.core.exceptions import HttpResponseError, ResourceNotFoundError
 from azure.core.pipeline.transport import (
     AsyncHttpResponse,
@@ -201,6 +202,7 @@ def _mock_requests_session(scenario: _RegistrationScenario, monkeypatch: pytest.
         response.url = url
         response._content = json.dumps(payload).encode()
         response._content_consumed = True
+        response.raw = Urllib3Response(body=response._content, status=status, headers=response.headers)
         return response
 
     monkeypatch.setattr(session, "request", respond)
