@@ -183,9 +183,19 @@ def _assert_registered_submission(scenario: _RegistrationScenario, job: Pipeline
 
 
 @pytest.mark.parametrize("surface", _SURFACES)
+@pytest.mark.parametrize(
+    "component_name, component_version",
+    [("hello_world", "1"), ("hello/world name", "release/1+candidate")],
+)
 def test_pipeline_registers_command_after_upload_and_preserves_reusable_authoring(
-    authored_job: PipelineJob, surface: str, monkeypatch: pytest.MonkeyPatch
+    authored_job: PipelineJob,
+    surface: str,
+    component_name: str,
+    component_version: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    authored_job.jobs["hello_world"]["component"]["name"] = component_name
+    authored_job.jobs["hello_world"]["component"]["version"] = component_version
     scenario = _RegistrationScenario(authored_job, surface)
     transport = _RegistrationTransport(scenario)
     with AIProjectClient(endpoint=_ENDPOINT, credential=_Credential(), transport=transport) as client:  # type: ignore[arg-type]
@@ -200,9 +210,19 @@ def test_pipeline_registers_command_after_upload_and_preserves_reusable_authorin
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("surface", _SURFACES)
+@pytest.mark.parametrize(
+    "component_name, component_version",
+    [("hello_world", "1"), ("hello/world name", "release/1+candidate")],
+)
 async def test_pipeline_registers_command_after_upload_and_preserves_reusable_authoring_async(
-    authored_job: PipelineJob, surface: str, monkeypatch: pytest.MonkeyPatch
+    authored_job: PipelineJob,
+    surface: str,
+    component_name: str,
+    component_version: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    authored_job.jobs["hello_world"]["component"]["name"] = component_name
+    authored_job.jobs["hello_world"]["component"]["version"] = component_version
     scenario = _RegistrationScenario(authored_job, surface)
     transport = _AsyncRegistrationTransport(scenario)
     async with AsyncAIProjectClient(
