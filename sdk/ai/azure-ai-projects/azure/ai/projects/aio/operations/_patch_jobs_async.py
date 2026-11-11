@@ -635,7 +635,9 @@ class JobsOperations(_GeneratedJobsOps):
             error_text = json.dumps(error_payload, indent=4) if isinstance(error_payload, dict) else error_payload
             raise RuntimeError("Exception : \n {} ".format(error_text))
 
-    async def _resolve_output_to_blob_ref(self, output_name: str, output: Union[_Output, Mapping[str, Any]]) -> BlobReference:
+    async def _resolve_output_to_blob_ref(
+        self, output_name: str, output: Union[_Output, Mapping[str, Any]]
+    ) -> BlobReference:
         """Resolve a job ``Output`` to a :class:`~azure.ai.projects.models.BlobReference`.
 
         :param output_name: The output name.

@@ -27,7 +27,6 @@ from azure.core.pipeline.transport import (
     HttpResponse,
     HttpTransport,
 )
-from azure.storage.blob import BlobProperties
 
 from azure.ai.projects import AIProjectClient, dsl
 from azure.ai.projects.aio import AIProjectClient as AsyncAIProjectClient
@@ -287,8 +286,12 @@ def test_jobs_download_registered_outputs(
     artifacts = Mock()
 
     with AIProjectClient(endpoint=_ENDPOINT, credential=_Credential(), transport=transport) as client:  # type: ignore[arg-type]
-        monkeypatch.setattr(client.beta.jobs, "_download_blob_reference", download)
-        monkeypatch.setattr(client.beta.jobs, "_download_default_artifacts", artifacts)
+        monkeypatch.setattr(
+            "azure.ai.projects.operations._patch_jobs.JobsOperations._download_blob_reference", download
+        )
+        monkeypatch.setattr(
+            "azure.ai.projects.operations._patch_jobs.JobsOperations._download_default_artifacts", artifacts
+        )
         client.beta.jobs.download(
             "download-job", download_path=tmp_path, output_name=None if download_all else "message", all=download_all
         )
@@ -323,8 +326,12 @@ async def test_jobs_download_registered_outputs_async(
     async with AsyncAIProjectClient(
         endpoint=_ENDPOINT, credential=_AsyncCredential(), transport=transport  # type: ignore[arg-type]
     ) as client:
-        monkeypatch.setattr(client.beta.jobs, "_download_blob_reference", download)
-        monkeypatch.setattr(client.beta.jobs, "_download_default_artifacts", artifacts)
+        monkeypatch.setattr(
+            "azure.ai.projects.aio.operations._patch_jobs_async.JobsOperations._download_blob_reference", download
+        )
+        monkeypatch.setattr(
+            "azure.ai.projects.aio.operations._patch_jobs_async.JobsOperations._download_default_artifacts", artifacts
+        )
         await client.beta.jobs.download(
             "download-job", download_path=tmp_path, output_name=None if download_all else "message", all=download_all
         )
@@ -418,9 +425,9 @@ def output_blob_contents() -> dict[str, bytes]:
 
 def _list_output_blobs(
     contents: dict[str, bytes], name_starts_with: Optional[str] = None, **kwargs: Any
-) -> list[BlobProperties]:
+) -> list[SimpleNamespace]:
     return [
-        BlobProperties(
+        SimpleNamespace(
             name=name,
             size=len(content),
             metadata={"hdi_isfolder": "true"} if name.endswith("/empty-directory") else {},
@@ -437,7 +444,9 @@ def _assert_downloaded_output(
     assert {
         path.relative_to(destination).as_posix(): path.read_bytes() for path in destination.rglob("*") if path.is_file()
     } == expected_files
-    assert {path.relative_to(destination).as_posix() for path in destination.rglob("*") if path.is_dir()} == expected_dirs
+    assert {
+        path.relative_to(destination).as_posix() for path in destination.rglob("*") if path.is_dir()
+    } == expected_dirs
 
 
 @pytest.mark.parametrize("prefix, expected_files, expected_dirs", _OUTPUT_DOWNLOAD_CASES)
@@ -494,7 +503,9 @@ async def test_jobs_download_blob_reference_async(
     async with AsyncAIProjectClient(
         endpoint=_ENDPOINT, credential=_AsyncCredential(), transport=_AsyncTransport([])  # type: ignore[arg-type]
     ) as client:
-        result = await client.beta.jobs._download_blob_reference(BlobReference(_download_blob_response(prefix)), tmp_path)
+        result = await client.beta.jobs._download_blob_reference(
+            BlobReference(_download_blob_response(prefix)), tmp_path
+        )
 
     _assert_downloaded_output(tmp_path, result, expected_files, expected_dirs)
     assert container.download_blob.await_count == len(expected_files)
