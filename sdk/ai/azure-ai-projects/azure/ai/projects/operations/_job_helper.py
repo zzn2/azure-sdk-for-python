@@ -18,6 +18,7 @@ from typing import (
     Dict,
     Iterable,
     List,
+    Mapping,
     Optional,
     Set,
     TextIO,
@@ -228,7 +229,10 @@ def _ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
 
 
-def _validate_output_for_download(output_name: str, output: _Output) -> None:
+def _validate_output_for_download(output_name: str, output: Union[_Output, Mapping[str, Any]]) -> _Output:
+    if not isinstance(output, _Output):
+        output = _Output(output)
+
     if not output.asset_name or not output.asset_version:
         raise ValueError(
             f"Output '{output_name}' has no registered asset (assetName / assetVersion is missing). "
@@ -241,7 +245,7 @@ def _validate_output_for_download(output_name: str, output: _Output) -> None:
         AssetTypes.URI_FOLDER,
         AssetTypes.SAFETENSORS_MODEL,
     ):
-        return
+        return output
 
     raise ValueError(
         f"Output '{output_name}' has unsupported jobOutputType '{out_type}'. "

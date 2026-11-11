@@ -13,7 +13,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from os import PathLike
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union, overload
+from typing import Any, Dict, List, Mapping, Optional, Tuple, Union, overload
 from urllib.parse import urlparse
 from uuid import uuid4
 
@@ -648,17 +648,17 @@ class JobsOperations(_GeneratedJobsOps):
             error_text = json.dumps(error_payload, indent=4) if isinstance(error_payload, dict) else error_payload
             raise RuntimeError("Exception : \n {} ".format(error_text))
 
-    def _resolve_output_to_blob_ref(self, output_name: str, output: _Output) -> BlobReference:
+    def _resolve_output_to_blob_ref(self, output_name: str, output: Union[_Output, Mapping[str, Any]]) -> BlobReference:
         """Resolve a job ``Output`` to a :class:`~azure.ai.projects.models.BlobReference`.
 
         :param output_name: The output name.
         :type output_name: str
         :param output: The job output object from the Get Job response.
-        :type output: ~azure.ai.projects.models.Output
+        :type output: ~azure.ai.projects.models.Output or Mapping[str, Any]
         :return: A blob reference describing the storage location and SAS credential.
         :rtype: ~azure.ai.projects.models.BlobReference
         """
-        _validate_output_for_download(output_name, output)
+        output = _validate_output_for_download(output_name, output)
         assert output.asset_name is not None and output.asset_version is not None
         if output.type == AssetTypes.SAFETENSORS_MODEL:
             model_version = self._models.get(name=output.asset_name, version=output.asset_version)
@@ -672,7 +672,7 @@ class JobsOperations(_GeneratedJobsOps):
         return credential.blob_reference
 
     def _download_blob_reference(self, blob_ref: BlobReference, destination: Path) -> Tuple[int, int]:
-        """Download every blob under ``blob_ref`` into ``destination``.
+        """Download the exact file or the folder contents at ``blob_ref`` into ``destination``.
 
         :param blob_ref: The blob reference to download.
         :type blob_ref: ~azure.ai.projects.models.BlobReference
@@ -694,21 +694,28 @@ class JobsOperations(_GeneratedJobsOps):
 
         with ContainerClient.from_container_url(container_url=sas_uri) as container_client:
             list_prefix = (prefix + "/") if prefix else ""
-            blobs = list(container_client.list_blobs(name_starts_with=list_prefix or None, include=["metadata"]))
+            blobs = [
+                blob
+                for blob in container_client.list_blobs(name_starts_with=prefix or None, include=["metadata"])
+                if blob.name == prefix or blob.name.startswith(list_prefix)
+            ]
             all_names = {b.name for b in blobs}
 
             file_count = 0
             total_bytes = 0
             for blob in blobs:
                 blob_name = blob.name
-                if list_prefix and blob_name.startswith(list_prefix):
-                    relative = blob_name[len(list_prefix) :]
+                is_folder = _is_folder_marker(blob, all_names)
+                if blob_name == prefix:
+                    if is_folder:
+                        continue
+                    relative = blob_name.rsplit("/", 1)[-1]
                 else:
-                    relative = blob_name
+                    relative = blob_name[len(list_prefix) :]
                 if not relative:
                     continue
                 local_path = destination / relative
-                if _is_folder_marker(blob, all_names):
+                if is_folder:
                     _ensure_dir(local_path)
                     continue
                 _ensure_dir(local_path.parent)
@@ -803,7 +810,7 @@ class JobsOperations(_GeneratedJobsOps):
         self,
         job_name: str,
         output_name: str,
-        output: _Output,
+        output: Union[_Output, Mapping[str, Any]],
         dest_root: Path,
     ) -> None:
         """Resolve and download a single named output into ``<dest_root>/named-outputs/<output_name>/``.
@@ -813,7 +820,7 @@ class JobsOperations(_GeneratedJobsOps):
         :param output_name: The output name to download.
         :type output_name: str
         :param output: The job output object from the Get Job response.
-        :type output: ~azure.ai.projects.models.Output
+        :type output: ~azure.ai.projects.models.Output or Mapping[str, Any]
         :param dest_root: The base local directory; the output is written into
             ``<dest_root>/named-outputs/<output_name>/``.
         :type dest_root: ~pathlib.Path

@@ -12,7 +12,9 @@ import runpy
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Union
+from types import SimpleNamespace
+from typing import Any, Optional, Union
+from unittest.mock import AsyncMock, MagicMock, Mock
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -25,11 +27,13 @@ from azure.core.pipeline.transport import (
     HttpResponse,
     HttpTransport,
 )
+from azure.storage.blob import BlobProperties
 
 from azure.ai.projects import AIProjectClient, dsl
 from azure.ai.projects.aio import AIProjectClient as AsyncAIProjectClient
 from azure.ai.projects.models import (
     AssetTypes,
+    BlobReference,
     CommandJob,
     DatasetVersion,
     Input,
@@ -246,6 +250,254 @@ def _assert_pipeline_jobs_requests(requests: list[HttpRequest], expected: dict[s
     assert urlparse(requests[2].url).path.endswith("/pipeline_jobs")
     assert "jobType" not in parse_qs(urlparse(requests[2].url).query)
     assert json.loads(requests[0].body) == {"properties": expected}
+
+
+def _download_job_response(kind: str) -> dict[str, Any]:
+    return {
+        "name": "download-job",
+        "properties": {
+            "jobType": kind,
+            "status": "Completed",
+            "outputs": {
+                "message": {"jobOutputType": "uri_file", "assetName": "offline-output", "assetVersion": "1"},
+            },
+        },
+    }
+
+
+def _download_blob_response(prefix: str) -> dict[str, Any]:
+    return {
+        "blobUri": f"https://fake-storage.blob.core.windows.net/outputs/{prefix}",
+        "storageAccountArmId": "/storageAccounts/fake-storage",
+        "credential": {"sasUri": "https://fake-storage.blob.core.windows.net/outputs", "type": "SAS"},
+    }
+
+
+@pytest.mark.parametrize("kind", ["Pipeline", "Command"])
+@pytest.mark.parametrize("download_all", [False, True])
+def test_jobs_download_registered_outputs(
+    kind: str, download_all: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    response = _download_job_response(kind)
+    if download_all:
+        response["properties"]["outputs"]["unregistered"] = {"jobOutputType": "uri_file"}
+    blob_response = _download_blob_response("jobs/run/message")
+    transport = _Transport([response, {"blobReference": blob_response}])
+    download = Mock(return_value=(1, 12))
+    artifacts = Mock()
+
+    with AIProjectClient(endpoint=_ENDPOINT, credential=_Credential(), transport=transport) as client:  # type: ignore[arg-type]
+        monkeypatch.setattr(client.beta.jobs, "_download_blob_reference", download)
+        monkeypatch.setattr(client.beta.jobs, "_download_default_artifacts", artifacts)
+        client.beta.jobs.download(
+            "download-job", download_path=tmp_path, output_name=None if download_all else "message", all=download_all
+        )
+
+    download.assert_called_once()
+    assert download.call_args.args[0].as_dict() == blob_response
+    assert download.call_args.args[1] == tmp_path / "named-outputs" / "message"
+    assert len(transport.requests) == 2
+    assert urlparse(transport.requests[1].url).path.endswith("/datasets/offline-output/versions/1/credentials")
+    if download_all:
+        artifacts.assert_called_once()
+        assert "Skipping output 'unregistered'" in caplog.text
+        assert "has no registered asset" in caplog.text
+    else:
+        artifacts.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["Pipeline", "Command"])
+@pytest.mark.parametrize("download_all", [False, True])
+async def test_jobs_download_registered_outputs_async(
+    kind: str, download_all: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    response = _download_job_response(kind)
+    if download_all:
+        response["properties"]["outputs"]["unregistered"] = {"jobOutputType": "uri_file"}
+    blob_response = _download_blob_response("jobs/run/message")
+    transport = _AsyncTransport([response, {"blobReference": blob_response}])
+    download = AsyncMock(return_value=(1, 12))
+    artifacts = AsyncMock()
+
+    async with AsyncAIProjectClient(
+        endpoint=_ENDPOINT, credential=_AsyncCredential(), transport=transport  # type: ignore[arg-type]
+    ) as client:
+        monkeypatch.setattr(client.beta.jobs, "_download_blob_reference", download)
+        monkeypatch.setattr(client.beta.jobs, "_download_default_artifacts", artifacts)
+        await client.beta.jobs.download(
+            "download-job", download_path=tmp_path, output_name=None if download_all else "message", all=download_all
+        )
+
+    download.assert_awaited_once()
+    assert download.call_args.args[0].as_dict() == blob_response
+    assert download.call_args.args[1] == tmp_path / "named-outputs" / "message"
+    assert len(transport.requests) == 2
+    assert urlparse(transport.requests[1].url).path.endswith("/datasets/offline-output/versions/1/credentials")
+    if download_all:
+        artifacts.assert_awaited_once()
+        assert "Skipping output 'unregistered'" in caplog.text
+        assert "has no registered asset" in caplog.text
+    else:
+        artifacts.assert_not_awaited()
+
+
+def test_jobs_download_unregistered_pipeline_output(tmp_path: Path) -> None:
+    response = _download_job_response("Pipeline")
+    response["properties"]["outputs"]["message"].update(assetName=None, assetVersion=None, uri=None)
+    transport = _Transport([response])
+
+    with AIProjectClient(endpoint=_ENDPOINT, credential=_Credential(), transport=transport) as client:  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="Output 'message' has no registered asset"):
+            client.beta.jobs.download("download-job", output_name="message", download_path=tmp_path)
+
+    assert len(transport.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_jobs_download_unregistered_pipeline_output_async(tmp_path: Path) -> None:
+    response = _download_job_response("Pipeline")
+    response["properties"]["outputs"]["message"].update(assetName=None, assetVersion=None, uri=None)
+    transport = _AsyncTransport([response])
+
+    async with AsyncAIProjectClient(
+        endpoint=_ENDPOINT, credential=_AsyncCredential(), transport=transport  # type: ignore[arg-type]
+    ) as client:
+        with pytest.raises(ValueError, match="Output 'message' has no registered asset"):
+            await client.beta.jobs.download("download-job", output_name="message", download_path=tmp_path)
+
+    assert len(transport.requests) == 1
+
+
+_OUTPUT_DOWNLOAD_CASES = [
+    pytest.param("jobs/run/message", {"message": b"hello world\n"}, set(), id="exact-file"),
+    pytest.param("jobs/run/empty", {"empty": b""}, set(), id="empty-file"),
+    pytest.param(
+        "jobs/run/output/",
+        {"nested/result.txt": b"nested\n", "zero": b""},
+        {"nested", "empty-directory"},
+        id="folder",
+    ),
+    pytest.param(
+        "",
+        {
+            "jobs/run/message": b"hello world\n",
+            "jobs/run/message-other": b"sibling",
+            "jobs/run/empty": b"",
+            "jobs/run/output/nested/result.txt": b"nested\n",
+            "jobs/run/output/zero": b"",
+            "jobs/run/output-other/ignored": b"sibling",
+        },
+        {
+            "jobs",
+            "jobs/run",
+            "jobs/run/output",
+            "jobs/run/output/nested",
+            "jobs/run/output/empty-directory",
+            "jobs/run/output-other",
+        },
+        id="container",
+    ),
+]
+
+
+@pytest.fixture
+def output_blob_contents() -> dict[str, bytes]:
+    return {
+        "jobs/run/message": b"hello world\n",
+        "jobs/run/message-other": b"sibling",
+        "jobs/run/empty": b"",
+        "jobs/run/output": b"",
+        "jobs/run/output/nested": b"",
+        "jobs/run/output/nested/result.txt": b"nested\n",
+        "jobs/run/output/zero": b"",
+        "jobs/run/output/empty-directory": b"",
+        "jobs/run/output-other/ignored": b"sibling",
+    }
+
+
+def _list_output_blobs(
+    contents: dict[str, bytes], name_starts_with: Optional[str] = None, **kwargs: Any
+) -> list[BlobProperties]:
+    return [
+        BlobProperties(
+            name=name,
+            size=len(content),
+            metadata={"hdi_isfolder": "true"} if name.endswith("/empty-directory") else {},
+        )
+        for name, content in contents.items()
+        if name.startswith(name_starts_with or "")
+    ]
+
+
+def _assert_downloaded_output(
+    destination: Path, result: tuple[int, int], expected_files: dict[str, bytes], expected_dirs: set[str]
+) -> None:
+    assert result == (len(expected_files), sum(len(content) for content in expected_files.values()))
+    assert {
+        path.relative_to(destination).as_posix(): path.read_bytes() for path in destination.rglob("*") if path.is_file()
+    } == expected_files
+    assert {path.relative_to(destination).as_posix() for path in destination.rglob("*") if path.is_dir()} == expected_dirs
+
+
+@pytest.mark.parametrize("prefix, expected_files, expected_dirs", _OUTPUT_DOWNLOAD_CASES)
+def test_jobs_download_blob_reference(
+    prefix: str,
+    expected_files: dict[str, bytes],
+    expected_dirs: set[str],
+    output_blob_contents: dict[str, bytes],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    container = MagicMock()
+    container.__enter__.return_value = container
+    container.list_blobs.side_effect = lambda **kwargs: _list_output_blobs(output_blob_contents, **kwargs)
+    container.download_blob.side_effect = lambda *, blob, **kwargs: SimpleNamespace(
+        readinto=lambda stream: stream.write(output_blob_contents[blob])
+    )
+    monkeypatch.setattr(
+        "azure.ai.projects.operations._patch_jobs.ContainerClient.from_container_url", Mock(return_value=container)
+    )
+
+    with AIProjectClient(endpoint=_ENDPOINT, credential=_Credential(), transport=_Transport([])) as client:  # type: ignore[arg-type]
+        result = client.beta.jobs._download_blob_reference(BlobReference(_download_blob_response(prefix)), tmp_path)
+
+    _assert_downloaded_output(tmp_path, result, expected_files, expected_dirs)
+    assert container.download_blob.call_count == len(expected_files)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prefix, expected_files, expected_dirs", _OUTPUT_DOWNLOAD_CASES)
+async def test_jobs_download_blob_reference_async(
+    prefix: str,
+    expected_files: dict[str, bytes],
+    expected_dirs: set[str],
+    output_blob_contents: dict[str, bytes],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def list_blobs(**kwargs: Any) -> Any:
+        for blob in _list_output_blobs(output_blob_contents, **kwargs):
+            yield blob
+
+    container = AsyncMock()
+    container.__aenter__.return_value = container
+    container.list_blobs = Mock(side_effect=list_blobs)
+    container.download_blob.side_effect = lambda *, blob, **kwargs: SimpleNamespace(
+        readinto=AsyncMock(side_effect=lambda stream: stream.write(output_blob_contents[blob]))
+    )
+    monkeypatch.setattr(
+        "azure.ai.projects.aio.operations._patch_jobs_async.AsyncContainerClient.from_container_url",
+        Mock(return_value=container),
+    )
+
+    async with AsyncAIProjectClient(
+        endpoint=_ENDPOINT, credential=_AsyncCredential(), transport=_AsyncTransport([])  # type: ignore[arg-type]
+    ) as client:
+        result = await client.beta.jobs._download_blob_reference(BlobReference(_download_blob_response(prefix)), tmp_path)
+
+    _assert_downloaded_output(tmp_path, result, expected_files, expected_dirs)
+    assert container.download_blob.await_count == len(expected_files)
 
 
 def _inline_pipeline() -> tuple[PipelineJob, CommandJob]:
